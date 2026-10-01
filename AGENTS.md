@@ -42,6 +42,7 @@ PC (Server)  WASAPI render "CABLE Input" ◄─ PlayoutHandle (jitter buffer, de
 - `crates/desktop/src/`: Windows tray app.
   - `audio/`: WASAPI loopback/render, devices, demand, `policy.rs` (IPolicyConfig default-device restore).
   - `ui.rs` (eframe), `tray.rs`, `selfinstall.rs`, `autostart.rs`, `instance.rs`, `cable_install.rs`.
+  - The window uses the brand gradient (indigo `#5B4BFF` → teal `#19C3D0`, the same as the Android launcher icon) and draws its icons with the painter. It repaints on status changes; the only timer (`request_repaint_after`, 40 ms) drives the level bars while PC audio streams and the window is open. Child widgets placed at an absolute rect use `ui.new_child(..)`: `scope_builder` moves the parent cursor and makes later cards overlap.
 - `crates/android-native/src/`
   - Pure, host-testable: `status.rs` (statusJson v2 + `NotifyGate`), `policy.rs`, `peers.rs`.
   - `android/` (cfg android only): `jni_api.rs`, `engine.rs` (tokio + Hub manager), `controller.rs` (`ab-audio` thread), `aaudio.rs`, `listener.rs`, `logging.rs`.
@@ -87,6 +88,7 @@ cargo ndk -t arm64-v8a clippy -p audiobridge-android --all-targets -- -D warning
   - PC: `%APPDATA%\AudioBridge` holds `server.key`, `pairing.secret`, `server.port`, `settings.json` and `pairing.txt`. Writes go through tmp+rename; corrupt files are regenerated. Changing `server.key` or `pairing.secret` breaks every existing pairing.
   - Phone: `<filesDir>/audiobridge/client.key`, plus SharedPreferences `audiobridge` (`paired_pcs` JSON list, `mic_enabled`, `autostart_done`).
 - **Default UDP port:** 47130, falling back to a random port.
+- **Screenshots and releases:** the pairing QR contains the PC's secret. Never publish it; promo shots replace it with a QR of the repo URL. GitHub Releases ship `AudioBridge.exe` (the release build) and `AudioBridge.apk` (the debug-signed APK from this machine's `~/.android/debug.keystore`; a different key can't update an installed app).
 
 ## Important Files
 - `Cargo.toml`: workspace deps, and profiles you must keep:
