@@ -1,0 +1,14 @@
+[package]
+name = "audiobridge-opus-sys"
+version.workspace = true
+edition.workspace = true
+license = "BSD-3-Clause"
+description = "Vendored libopus (float build, stack temporaries) compiled with cc; no cmake"
+links = "audiobridge_opus"
+build = "build.rs"
+
+[lib]
+name = "audiobridge_opus_sys"
+
+[build-dependencies]
+cc = { workspace = true }

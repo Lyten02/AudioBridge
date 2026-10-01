@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/opus-sys", "crates/desktop", "crates/android-native"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Lyten02/AudioBridge"
+
+[workspace.dependencies]
+audiobridge-core = { path = "crates/core" }
+audiobridge-opus-sys = { path = "crates/opus-sys" }
+cc = "1"
+iroh = "1.3.0"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio-util = "0.7"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+rtrb = "0.3"
+bytes = "1"
+data-encoding = "2"
+if-addrs = "0.13"
+getrandom = "0.3"
+parking_lot = "0.12"
+
+# Disk is tight on this machine: keep dev artifacts small.
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

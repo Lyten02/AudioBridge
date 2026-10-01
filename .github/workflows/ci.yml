@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: windows-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy -p audiobridge-core -p audiobridge-desktop -p audiobridge-android --all-targets -- -D warnings
+      - name: Core tests
+        # the real-network integration tests are timing-sensitive; they are run locally
+        run: cargo test -p audiobridge-core --lib --test rt_alloc
+      - name: Desktop tests
+        run: cargo test -p audiobridge-desktop
+      - name: Android native host tests
+        run: cargo test -p audiobridge-android

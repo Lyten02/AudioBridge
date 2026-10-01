@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name" translatable="false">AudioBridge</string>
+
+    <!-- Notification -->
+    <string name="channel_status">Статус соединения</string>
+    <string name="channel_status_desc">Постоянное уведомление, пока AudioBridge работает в фоне</string>
+    <string name="notif_connected">Подключено: %1$s</string>
+    <string name="notif_connected_one_path">Подключено: %1$s · %2$s</string>
+    <string name="notif_connecting">Подключение…</string>
+    <string name="notif_offline">Нет связи</string>
+    <string name="notif_mic_live">Микрофон передаётся на ПК</string>
+    <string name="notif_mic_ready">Микрофон включён</string>
+    <string name="notif_action_mic_on">Включить микрофон</string>
+    <string name="notif_action_mic_off">Выключить микрофон</string>
+
+    <!-- Paths -->
+    <string name="path_lan">Локальная сеть</string>
+    <string name="path_tailscale">Tailscale</string>
+    <string name="path_direct">Напрямую через интернет</string>
+    <string name="path_relay">Через relay-сервер</string>
+
+    <!-- Onboarding -->
+    <string name="hero_title">Звук компьютера в ваших наушниках</string>
+    <string name="hero_body">Звук с ПК играет в Bluetooth-наушниках телефона, а микрофон телефона становится микрофоном компьютера.</string>
+    <string name="scan_qr">Сканировать QR-код</string>
+    <string name="scan_hint">Откройте AudioBridge на компьютере</string>
+    <string name="scan_failed">Не удалось открыть сканер QR-кодов</string>
+    <string name="scan_invalid">Это не QR-код AudioBridge</string>
+    <string name="pc_added">Компьютер %1$s добавлен</string>
+    <string name="pc_updated">Компьютер %1$s обновлён</string>
+
+    <!-- Overview -->
+    <string name="overview_connected">Подключено %1$d из %2$d</string>
+    <string name="overview_all_connected">Всё подключено</string>
+    <string name="overview_connecting">Подключение…</string>
+    <string name="overview_offline">Нет связи</string>
+    <string name="overview_audio_playing">Звук с ПК играет в наушниках</string>
+    <string name="overview_audio_idle">Звук появится, как только ПК начнёт играть</string>
+    <string name="overview_offline_hint">Подключимся автоматически, когда компьютер будет в сети</string>
+
+    <!-- Computers -->
+    <string name="pcs_title">Компьютеры</string>
+    <string name="add_pc">Добавить компьютер</string>
+    <string name="add_pc_hint">Отсканируйте QR-код в AudioBridge на другом компьютере</string>
+    <string name="state_connecting">Подключение…</string>
+    <string name="state_connected">Подключено</string>
+    <string name="state_offline">Нет связи</string>
+    <string name="stat_ping">Пинг %1$d мс</string>
+    <string name="stat_buffer">Буфер %1$d мс</string>
+    <string name="stat_audio">Звук</string>
+    <string name="stat_audio_off">Звук выключен на ПК</string>
+    <string name="mic_badge">микрофон используется</string>
+    <string name="remove">Удалить</string>
+    <string name="remove_title">Удалить %1$s?</string>
+    <string name="remove_body">Телефон перестанет подключаться к этому компьютеру. Чтобы вернуть его, снова отсканируйте QR-код.</string>
+    <string name="cancel">Отмена</string>
+
+    <!-- Mic -->
+    <string name="mic_title">Микрофон телефона</string>
+    <string name="mic_in_use">Микрофон сейчас используется на ПК</string>
+    <string name="mic_in_use_on">Микрофон сейчас используется на ПК: %1$s</string>
+    <string name="mic_waiting">Включится, когда программа на ПК откроет микрофон</string>
+    <string name="mic_off">Выключен</string>
+    <string name="mic_need_permission">Нужно разрешение на микрофон</string>
+    <string name="mic_permission_denied">Без разрешения микрофон не работает</string>
+    <string name="open_settings">Настройки</string>
+
+    <!-- Checklist -->
+    <string name="setup_title">Чтобы работало в фоне</string>
+    <string name="setup_notifications">Уведомления</string>
+    <string name="setup_notifications_body">Статус соединения и кнопка микрофона</string>
+    <string name="setup_mic">Микрофон</string>
+    <string name="setup_mic_body">Чтобы компьютер мог использовать микрофон телефона</string>
+    <string name="setup_battery">Без ограничений батареи</string>
+    <string name="setup_battery_body">Иначе система может оборвать связь в фоне</string>
+    <string name="setup_autostart">Автозапуск и закрепление</string>
+    <string name="setup_autostart_body">Включите автозапуск AudioBridge в настройках HyperOS и закрепите приложение в «Недавних» (потяните карточку вниз → замок) — иначе «Очистить всё» выключит его до следующего ручного запуска. Затем нажмите «Готово»</string>
+    <string name="action_allow">Разрешить</string>
+    <string name="action_open">Открыть</string>
+    <string name="action_done">Готово</string>
+</resources>

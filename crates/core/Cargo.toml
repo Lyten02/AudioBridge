@@ -1,0 +1,26 @@
+[package]
+name = "audiobridge-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "audiobridge_core"
+
+[dependencies]
+iroh = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+rtrb = { workspace = true }
+bytes = { workspace = true }
+data-encoding = { workspace = true }
+if-addrs = { workspace = true }
+getrandom = { workspace = true }
+audiobridge-opus-sys = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+tempfile = "3"
