@@ -1,5 +1,7 @@
 # AudioBridge
 
+![AudioBridge: телефон как беспроводные наушники и микрофон для ПК](docs/screenshots/hero.png)
+
 **Телефон становится беспроводными наушниками и микрофоном для компьютера с Windows.**
 
 AudioBridge передаёт весь звук компьютера на Android-телефон, а тот играет его в Bluetooth-наушники, подключённые к телефону. В обратную сторону микрофон телефона появляется на ПК как обычный микрофон для Discord, Zoom, OBS и игр.
@@ -7,6 +9,16 @@ AudioBridge передаёт весь звук компьютера на Android
 Один раз сканируешь QR-код. Дальше оба приложения работают в фоне, запускаются вместе с системой и сами переподключаются. Без аккаунтов, без серверов и без ввода IP-адресов.
 
 [English version](README.md)
+
+<p align="center">
+  <img src="docs/screenshots/desktop.png" alt="Приложение для Windows" height="480">
+  &nbsp;
+  <img src="docs/screenshots/desktop-pairing.png" alt="Экран подключения" height="480">
+  &nbsp;
+  <img src="docs/screenshots/phone.png" alt="Приложение для Android" height="480">
+</p>
+
+![Почему AudioBridge](docs/screenshots/features.png)
 
 ## Возможности
 

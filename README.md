@@ -1,5 +1,7 @@
 # AudioBridge
 
+![AudioBridge: your phone as wireless headphones and microphone for your PC](docs/screenshots/hero.png)
+
 **Your phone becomes the wireless headphones and microphone of your Windows PC.**
 
 AudioBridge streams everything your PC plays to your Android phone, which plays it in the Bluetooth headphones connected to the phone. In the other direction, the phone's microphone shows up on the PC as a regular microphone for Discord, Zoom, OBS or games.
@@ -7,6 +9,14 @@ AudioBridge streams everything your PC plays to your Android phone, which plays 
 Pair once by scanning a QR code. After that both apps run in the background, start on boot and reconnect by themselves. No accounts, no servers to configure, no IP addresses to type.
 
 [Русская версия](README.ru.md)
+
+<p align="center">
+  <img src="docs/screenshots/desktop.png" alt="Windows app" height="480">
+  &nbsp;
+  <img src="docs/screenshots/desktop-pairing.png" alt="Pairing screen" height="480">
+  &nbsp;
+  <img src="docs/screenshots/phone.png" alt="Android app" height="480">
+</p>
 
 ## Features
 
