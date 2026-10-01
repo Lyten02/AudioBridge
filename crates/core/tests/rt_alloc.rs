@@ -93,7 +93,7 @@ async fn push_and_fill_never_allocate() {
         let mut out2 = vec![0f32; 192 * 2];
         let mut out1 = vec![0f32; 441];
         for block in 0..300u64 {
-            for f in stereo.chunks_exact_mut(2) {
+            for f in stereo.as_chunks_mut::<2>().0 {
                 f.fill(phase.sin() * 0.5);
                 phase += 0.06;
             }

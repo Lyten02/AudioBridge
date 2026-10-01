@@ -92,20 +92,20 @@ impl StreamFormat {
     /// Decodes `frames` frames from raw device bytes, appending interleaved f32.
     pub fn decode(&self, bytes: &[u8], out: &mut Vec<f32>) {
         match self.kind {
-            SampleKind::F32 => out.extend(bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))),
+            SampleKind::F32 => out.extend(bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b))),
             SampleKind::I16 => {
-                out.extend(bytes.chunks_exact(2).map(|b| f32::from(i16::from_le_bytes([b[0], b[1]])) / 32768.0))
+                out.extend(bytes.as_chunks::<2>().0.iter().map(|b| f32::from(i16::from_le_bytes(*b)) / 32768.0))
             }
             SampleKind::I24 => out.extend(
                 bytes
-                    .chunks_exact(3)
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
                     .map(|b| (i32::from_le_bytes([0, b[0], b[1], b[2]]) >> 8) as f32 / 8_388_608.0),
             ),
-            SampleKind::I32 => out.extend(
-                bytes
-                    .chunks_exact(4)
-                    .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32 / 2_147_483_648.0),
-            ),
+            SampleKind::I32 => {
+                out.extend(bytes.as_chunks::<4>().0.iter().map(|b| i32::from_le_bytes(*b) as f32 / 2_147_483_648.0))
+            }
         }
     }
 
@@ -113,24 +113,24 @@ impl StreamFormat {
     pub fn encode(&self, samples: &[f32], dst: &mut [u8]) {
         match self.kind {
             SampleKind::F32 => {
-                for (s, d) in samples.iter().zip(dst.chunks_exact_mut(4)) {
-                    d.copy_from_slice(&s.to_le_bytes());
+                for (s, d) in samples.iter().zip(dst.as_chunks_mut::<4>().0) {
+                    *d = s.to_le_bytes();
                 }
             }
             SampleKind::I16 => {
-                for (s, d) in samples.iter().zip(dst.chunks_exact_mut(2)) {
-                    d.copy_from_slice(&((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes());
+                for (s, d) in samples.iter().zip(dst.as_chunks_mut::<2>().0) {
+                    *d = ((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes();
                 }
             }
             SampleKind::I24 => {
-                for (s, d) in samples.iter().zip(dst.chunks_exact_mut(3)) {
+                for (s, d) in samples.iter().zip(dst.as_chunks_mut::<3>().0) {
                     let v = ((s.clamp(-1.0, 1.0) * 8_388_607.0) as i32).to_le_bytes();
                     d.copy_from_slice(&v[..3]);
                 }
             }
             SampleKind::I32 => {
-                for (s, d) in samples.iter().zip(dst.chunks_exact_mut(4)) {
-                    d.copy_from_slice(&((f64::from(s.clamp(-1.0, 1.0)) * 2_147_483_647.0) as i32).to_le_bytes());
+                for (s, d) in samples.iter().zip(dst.as_chunks_mut::<4>().0) {
+                    *d = ((f64::from(s.clamp(-1.0, 1.0)) * 2_147_483_647.0) as i32).to_le_bytes();
                 }
             }
         }

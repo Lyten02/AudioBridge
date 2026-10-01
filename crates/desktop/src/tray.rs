@@ -148,8 +148,8 @@ unsafe fn make_icon(size: u32, connected: bool) -> Result<HICON> {
         let mut bits = std::ptr::null_mut();
         let color = CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut bits, None, 0)?;
         let dst = std::slice::from_raw_parts_mut(bits.cast::<u8>(), rgba.len());
-        for (d, s) in dst.chunks_exact_mut(4).zip(rgba.chunks_exact(4)) {
-            d.copy_from_slice(&[s[2], s[1], s[0], s[3]]);
+        for (d, s) in dst.as_chunks_mut::<4>().0.iter_mut().zip(rgba.as_chunks::<4>().0) {
+            *d = [s[2], s[1], s[0], s[3]];
         }
         let stride = size.div_ceil(16) as usize * 2;
         let mask_bits = vec![0u8; stride * size as usize];

@@ -1,14 +1,17 @@
 //! The main window. Created on demand from the tray and destroyed on close, so no GL context or
-//! window exists while AudioBridge sits in the tray. Repaints only on status changes.
+//! window exists while AudioBridge sits in the tray. Repaints on status changes; the only
+//! animation (the level bars) runs while PC audio is streaming and the window is open.
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use audiobridge_core::pairing::PairingInfo;
 use audiobridge_core::session::{ConnState, PathKind, Status};
 use eframe::egui::{
-    self, pos2, vec2, Align, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Layout, Margin,
-    Rect, RichText, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Ui,
+    self, pos2, vec2, Align, Align2, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Layout,
+    Margin, Mesh, Painter, Pos2, Rect, RichText, Sense, Shape, Stroke, StrokeKind, TextureHandle, TextureOptions, Ui,
+    UiBuilder,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::core::{w, BOOL, HSTRING};
@@ -23,27 +26,36 @@ use crate::icon;
 use crate::settings::Settings;
 use crate::shared::shared;
 
-const BG: Color32 = Color32::from_rgb(0x0E, 0x11, 0x16);
-const CARD: Color32 = Color32::from_rgb(0x17, 0x1B, 0x22);
-const CARD_STROKE: Color32 = Color32::from_rgb(0x24, 0x29, 0x33);
-const TEXT: Color32 = Color32::from_rgb(0xE6, 0xE8, 0xEB);
-const MUTED: Color32 = Color32::from_rgb(0x8B, 0x93, 0xA1);
-const GREEN: Color32 = Color32::from_rgb(0x34, 0xD3, 0x99);
+const BG: Color32 = Color32::from_rgb(0x0B, 0x0D, 0x14);
+const CARD: Color32 = Color32::from_rgb(0x13, 0x16, 0x21);
+const CARD_HOVER: Color32 = Color32::from_rgb(0x1A, 0x1E, 0x2C);
+const CARD_STROKE: Color32 = Color32::from_rgb(0x23, 0x28, 0x38);
+const TEXT: Color32 = Color32::from_rgb(0xEE, 0xF0, 0xF6);
+const MUTED: Color32 = Color32::from_rgb(0x8A, 0x91, 0xA8);
+/// Brand gradient (matches the Android launcher icon).
+const INDIGO: Color32 = Color32::from_rgb(0x5B, 0x4B, 0xFF);
+const TEAL: Color32 = Color32::from_rgb(0x19, 0xC3, 0xD0);
+const GREEN: Color32 = Color32::from_rgb(0x4A, 0xDE, 0x80);
 const AMBER: Color32 = Color32::from_rgb(0xF5, 0xB5, 0x44);
 const RED: Color32 = Color32::from_rgb(0xF8, 0x71, 0x71);
-const LINK: Color32 = Color32::from_rgb(0x6E, 0xA8, 0xFE);
-const TOGGLE_OFF: Color32 = Color32::from_rgb(0x3A, 0x40, 0x4C);
-const WARN_BG: Color32 = Color32::from_rgb(0x26, 0x1F, 0x12);
+const LINK: Color32 = Color32::from_rgb(0x7D, 0xD8, 0xE2);
+const TOGGLE_OFF: Color32 = Color32::from_rgb(0x2E, 0x33, 0x45);
+const WARN_BG: Color32 = Color32::from_rgb(0x24, 0x1D, 0x10);
 const WARN_STROKE: Color32 = Color32::from_rgb(0x5A, 0x45, 0x15);
 
 const VB_CABLE_URL: &str = "https://vb-audio.com/Cable/";
+const REPO_URL: &str = "https://github.com/Lyten02/AudioBridge";
+
+const PAD: f32 = 16.0;
+const GAP: f32 = 12.0;
+const TILE_H: f32 = 148.0;
 
 /// Opens the window and blocks until it is closed (the app keeps running in the tray).
 pub fn run_window() {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("AudioBridge")
-            .with_inner_size([380.0, 600.0])
+            .with_inner_size([400.0, 680.0])
             .with_resizable(false)
             .with_maximize_button(false)
             .with_icon(Arc::new(egui::IconData { rgba: icon::render(64, false), width: 64, height: 64 })),
@@ -96,6 +108,7 @@ fn setup_style(ctx: &egui::Context) {
     v.override_text_color = Some(TEXT);
     v.hyperlink_color = LINK;
     v.widgets.inactive.weak_bg_fill = TOGGLE_OFF;
+    v.widgets.hovered.weak_bg_fill = CARD_STROKE;
     v.widgets.inactive.corner_radius = CornerRadius::same(10);
     v.widgets.hovered.corner_radius = CornerRadius::same(10);
     v.widgets.active.corner_radius = CornerRadius::same(10);
@@ -131,7 +144,7 @@ fn semibold(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name("semibold".into()))
 }
 
-pub fn path_label(p: PathKind) -> &'static str {
+fn path_label(p: PathKind) -> &'static str {
     match p {
         PathKind::Lan => "Локальная сеть",
         PathKind::Tailscale => "Tailscale",
@@ -144,10 +157,6 @@ fn status_line(s: &Status) -> (String, Color32) {
     match s.state {
         ConnState::Connected => {
             let mut t = String::from("Подключено");
-            if let Some(p) = s.path {
-                t.push_str(" · ");
-                t.push_str(path_label(p));
-            }
             if let Some(rtt) = s.rtt_ms {
                 t.push_str(&format!(" · {rtt:.0} мс"));
             }
@@ -168,11 +177,148 @@ fn open_url(url: &str) {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Drawing primitives
+
+/// Outline of a rounded rectangle (clockwise, 9 points per corner).
+fn rounded_points(rect: Rect, r: f32) -> Vec<Pos2> {
+    let r = r.min(rect.width() / 2.0).min(rect.height() / 2.0);
+    let corners = [
+        (pos2(rect.right() - r, rect.bottom() - r), 0.0),
+        (pos2(rect.left() + r, rect.bottom() - r), 90.0),
+        (pos2(rect.left() + r, rect.top() + r), 180.0),
+        (pos2(rect.right() - r, rect.top() + r), 270.0),
+    ];
+    let mut pts = Vec::with_capacity(36);
+    for (c, start) in corners {
+        for i in 0..=8 {
+            let a = (start + 90.0 * i as f32 / 8.0_f32).to_radians();
+            pts.push(pos2(c.x + r * a.cos(), c.y + r * a.sin()));
+        }
+    }
+    pts
+}
+
+/// Rounded rectangle filled with the brand gradient (mostly left → right), with a soft edge.
+fn gradient_rect(painter: &Painter, rect: Rect, r: f32, from: Color32, to: Color32) {
+    let pts = rounded_points(rect, r);
+    let color = |p: Pos2| {
+        let t = (p.x - rect.left()) / rect.width() * 0.8 + (p.y - rect.top()) / rect.height() * 0.2;
+        from.lerp_to_gamma(to, t.clamp(0.0, 1.0))
+    };
+    let mut mesh = Mesh::default();
+    mesh.colored_vertex(rect.center(), color(rect.center()));
+    for p in &pts {
+        mesh.colored_vertex(*p, color(*p));
+    }
+    let n = pts.len() as u32;
+    for i in 0..n {
+        mesh.add_triangle(0, 1 + i, 1 + (i + 1) % n);
+    }
+    painter.add(Shape::mesh(mesh));
+    painter.add(Shape::closed_line(pts, Stroke::new(1.0, Color32::from_white_alpha(30))));
+}
+
+fn arc(center: Pos2, radius: f32, from_deg: f32, to_deg: f32) -> Vec<Pos2> {
+    (0..=24)
+        .map(|i| {
+            let a = (from_deg + (to_deg - from_deg) * i as f32 / 24.0).to_radians();
+            pos2(center.x + radius * a.cos(), center.y + radius * a.sin())
+        })
+        .collect()
+}
+
+fn icon_headphones(p: &Painter, rect: Rect, color: Color32) {
+    let s = rect.width();
+    let c = rect.center();
+    let r = s * 0.32;
+    p.line(arc(pos2(c.x, c.y + s * 0.06), r, 180.0, 360.0), Stroke::new(s * 0.085, color));
+    for sx in [-1.0, 1.0] {
+        let cup = Rect::from_center_size(pos2(c.x + sx * r, c.y + s * 0.2), vec2(s * 0.17, s * 0.3));
+        p.rect_filled(cup, CornerRadius::same((s * 0.06) as u8), color);
+    }
+}
+
+fn icon_speaker(p: &Painter, rect: Rect, color: Color32) {
+    let s = rect.width();
+    let c = rect.center();
+    let x0 = c.x - s * 0.32;
+    let box_ = Rect::from_min_max(pos2(x0, c.y - s * 0.12), pos2(x0 + s * 0.16, c.y + s * 0.12));
+    p.rect_filled(box_, CornerRadius::same(1), color);
+    p.add(Shape::convex_polygon(
+        vec![
+            pos2(box_.right() - 0.5, c.y - s * 0.12),
+            pos2(c.x + s * 0.04, c.y - s * 0.3),
+            pos2(c.x + s * 0.04, c.y + s * 0.3),
+            pos2(box_.right() - 0.5, c.y + s * 0.12),
+        ],
+        color,
+        Stroke::NONE,
+    ));
+    let w = Stroke::new(s * 0.07, color);
+    p.line(arc(pos2(c.x + s * 0.04, c.y), s * 0.16, -45.0, 45.0), w);
+    p.line(arc(pos2(c.x + s * 0.04, c.y), s * 0.3, -50.0, 50.0), w);
+}
+
+fn icon_mic(p: &Painter, rect: Rect, color: Color32) {
+    let s = rect.width();
+    let c = rect.center();
+    let capsule = Rect::from_center_size(pos2(c.x, c.y - s * 0.1), vec2(s * 0.24, s * 0.42));
+    p.rect_filled(capsule, CornerRadius::same((s * 0.12) as u8), color);
+    let w = Stroke::new(s * 0.07, color);
+    p.line(arc(pos2(c.x, c.y - s * 0.04), s * 0.24, 0.0, 180.0), w);
+    p.line(vec![pos2(c.x, c.y + s * 0.2), pos2(c.x, c.y + s * 0.34)], w);
+    p.line(vec![pos2(c.x - s * 0.13, c.y + s * 0.34), pos2(c.x + s * 0.13, c.y + s * 0.34)], w);
+}
+
+fn icon_phone(p: &Painter, rect: Rect, color: Color32) {
+    let s = rect.width();
+    let body = Rect::from_center_size(rect.center(), vec2(s * 0.4, s * 0.66));
+    p.rect_stroke(body, CornerRadius::same((s * 0.08) as u8), Stroke::new(s * 0.07, color), StrokeKind::Middle);
+    p.circle_filled(pos2(body.center().x, body.bottom() - s * 0.1), s * 0.035, color);
+}
+
+fn icon_qr(p: &Painter, rect: Rect, color: Color32) {
+    let s = rect.width() / 3.0;
+    for (x, y) in [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0)] {
+        let r = Rect::from_min_size(pos2(rect.left() + x * s, rect.top() + y * s), vec2(s * 0.95, s * 0.95));
+        p.rect_stroke(r, CornerRadius::same(1), Stroke::new(1.4, color), StrokeKind::Inside);
+    }
+    p.rect_filled(Rect::from_min_size(pos2(rect.left() + 2.0 * s, rect.top() + 2.0 * s), vec2(s * 0.6, s * 0.6)), 0.0, color);
+}
+
+/// Equalizer-like level bars; animated while `live`.
+fn level_bars(p: &Painter, rect: Rect, bars: usize, live: bool, time: f64, color: Color32) {
+    let w = rect.width() / (bars as f32 * 2.0 - 1.0);
+    for i in 0..bars {
+        let h = if live {
+            let phase = time * (5.0 + i as f64 * 1.3) + i as f64 * 1.7;
+            let v = 0.5 + 0.5 * phase.sin() * (time * 2.3 + i as f64).cos();
+            rect.height() * (0.25 + 0.75 * v as f32)
+        } else {
+            w
+        };
+        let x = rect.left() + i as f32 * 2.0 * w;
+        let r = Rect::from_min_max(pos2(x, rect.bottom() - h), pos2(x + w, rect.bottom()));
+        p.rect_filled(r, CornerRadius::same((w / 2.0) as u8), color);
+    }
+}
+
+/// Circle badge with the brand gradient (or grey when disabled) and a white icon.
+fn badge(p: &Painter, rect: Rect, enabled: bool, icon: fn(&Painter, Rect, Color32)) {
+    if enabled {
+        gradient_rect(p, rect, rect.width() / 2.0, INDIGO, TEAL);
+    } else {
+        p.circle_filled(rect.center(), rect.width() / 2.0, TOGGLE_OFF);
+    }
+    icon(p, rect.shrink(rect.width() * 0.22), if enabled { Color32::WHITE } else { MUTED });
+}
+
 fn card<R>(ui: &mut Ui, fill: Color32, stroke: Color32, add: impl FnOnce(&mut Ui) -> R) -> R {
     egui::Frame::new()
         .fill(fill)
         .stroke(Stroke::new(1.0, stroke))
-        .corner_radius(CornerRadius::same(14))
+        .corner_radius(CornerRadius::same(16))
         .inner_margin(Margin::same(16))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -181,14 +327,18 @@ fn card<R>(ui: &mut Ui, fill: Color32, stroke: Color32, add: impl FnOnce(&mut Ui
         .inner
 }
 
-/// iOS-style switch. Returns true when clicked.
+/// Switch. Returns true when clicked.
 fn toggle(ui: &mut Ui, on: bool) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(vec2(42.0, 24.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(vec2(44.0, 26.0), Sense::click());
     let t = ui.ctx().animate_bool_responsive(resp.id, on);
     let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(12), TOGGLE_OFF.lerp_to_gamma(GREEN, t));
-    let x = egui::lerp((rect.left() + 12.0)..=(rect.right() - 12.0), t);
-    painter.circle_filled(pos2(x, rect.center().y), 9.0, Color32::WHITE);
+    if t > 0.0 {
+        gradient_rect(painter, rect, 13.0, TOGGLE_OFF.lerp_to_gamma(INDIGO, t), TOGGLE_OFF.lerp_to_gamma(TEAL, t));
+    } else {
+        painter.rect_filled(rect, CornerRadius::same(13), TOGGLE_OFF);
+    }
+    let x = egui::lerp((rect.left() + 13.0)..=(rect.right() - 13.0), t);
+    painter.circle_filled(pos2(x, rect.center().y), 10.0, Color32::WHITE);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }
 
@@ -198,7 +348,7 @@ fn switch_row(ui: &mut Ui, title: &str, subtitle: Option<&str>, on: bool) -> boo
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
-            ui.label(RichText::new(title).size(15.0).color(TEXT));
+            ui.label(RichText::new(title).size(14.5).color(TEXT));
             if let Some(sub) = subtitle {
                 ui.label(RichText::new(sub).size(12.5).color(MUTED));
             }
@@ -209,6 +359,25 @@ fn switch_row(ui: &mut Ui, title: &str, subtitle: Option<&str>, on: bool) -> boo
     });
     clicked
 }
+
+/// Full-width secondary button with an optional leading icon.
+fn wide_button(ui: &mut Ui, text: &str, icon: Option<fn(&Painter, Rect, Color32)>) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 42.0), Sense::click());
+    let painter = ui.painter();
+    let fill = if resp.hovered() { CARD_HOVER } else { CARD };
+    painter.rect(rect, CornerRadius::same(12), fill, Stroke::new(1.0, CARD_STROKE), StrokeKind::Inside);
+    let galley = painter.layout_no_wrap(text.to_owned(), FontId::proportional(14.0), TEXT);
+    let icon_w = if icon.is_some() { 22.0 } else { 0.0 };
+    let x = rect.center().x - (galley.size().x + icon_w) / 2.0;
+    if let Some(icon) = icon {
+        icon(painter, Rect::from_center_size(pos2(x + 7.0, rect.center().y), vec2(14.0, 14.0)), LINK);
+    }
+    painter.galley(pos2(x + icon_w, rect.center().y - galley.size().y / 2.0), galley, TEXT);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+}
+
+// ---------------------------------------------------------------------------------------------
+// Window
 
 #[derive(Default)]
 struct UiApp {
@@ -231,45 +400,190 @@ impl eframe::App for UiApp {
         if !connected {
             self.show_qr = false;
         }
+        let live = connected && status.pc_audio.active;
+        if live {
+            ui.ctx().request_repaint_after(Duration::from_millis(40));
+        }
 
         ui.painter().rect_filled(ui.max_rect(), CornerRadius::ZERO, BG);
-        egui::Frame::new().inner_margin(Margin::symmetric(18, 16)).show(ui, |ui| {
-            header(ui, &status);
-            ui.add_space(10.0);
+        egui::Frame::new().inner_margin(Margin::same(PAD as i8)).show(ui, |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 12.0;
+                ui.spacing_mut().item_spacing.y = GAP;
+                hero(ui, &status, live);
                 warnings(ui, &devices, &settings);
                 if !connected || self.show_qr {
                     self.qr_card(ui, pairing.as_deref(), connected, &status);
                 } else {
                     connected_cards(ui, &status, &settings, &devices);
-                    ui.vertical_centered(|ui| {
-                        if ui.link(RichText::new("Показать QR-код").size(13.5).color(LINK)).clicked() {
-                            self.show_qr = true;
-                        }
-                    });
+                    if wide_button(ui, "Показать QR-код", Some(icon_qr)) {
+                        self.show_qr = true;
+                    }
                 }
                 card(ui, CARD, CARD_STROKE, |ui| {
-                    if switch_row(ui, "Запускать вместе с Windows", None, settings.autostart) {
+                    if switch_row(ui, "Запускать вместе с Windows", Some("Работает в фоне из трея"), settings.autostart) {
                         sh.set_autostart(!settings.autostart);
                     }
                 });
+                footer(ui);
             });
         });
     }
 }
 
-fn header(ui: &mut Ui, status: &Status) {
-    ui.label(RichText::new("AudioBridge").font(semibold(24.0)).color(TEXT));
+/// Gradient header: logo, name, connection state and live level bars.
+fn hero(ui: &mut Ui, status: &Status, live: bool) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 104.0), Sense::hover());
+    let p = ui.painter();
+    gradient_rect(p, rect, 20.0, INDIGO, TEAL);
+
+    let logo = Rect::from_min_size(pos2(rect.left() + 18.0, rect.center().y - 28.0), vec2(56.0, 56.0));
+    p.rect_filled(logo, CornerRadius::same(16), Color32::from_white_alpha(38));
+    icon_headphones(p, logo.shrink(12.0), Color32::WHITE);
+
+    let x = logo.right() + 14.0;
+    p.text(pos2(x, rect.center().y - 12.0), Align2::LEFT_CENTER, "AudioBridge", semibold(22.0), Color32::WHITE);
     let (text, color) = status_line(status);
-    let galley = ui.painter().layout_no_wrap(text, FontId::proportional(13.0), color);
-    let size = vec2(galley.size().x + 34.0, 26.0);
-    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-    let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(13), color.gamma_multiply(0.14));
-    painter.rect_stroke(rect, CornerRadius::same(13), Stroke::new(1.0, color.gamma_multiply(0.35)), StrokeKind::Inside);
-    painter.circle_filled(pos2(rect.left() + 14.0, rect.center().y), 4.0, color);
-    painter.galley(pos2(rect.left() + 24.0, rect.center().y - galley.size().y / 2.0), galley, color);
+    let dot = pos2(x + 5.0, rect.center().y + 15.0);
+    p.circle_filled(dot, 7.0, Color32::from_black_alpha(60));
+    p.circle_filled(dot, 4.0, color);
+    p.text(
+        pos2(x + 16.0, dot.y),
+        Align2::LEFT_CENTER,
+        text,
+        FontId::proportional(13.5),
+        Color32::from_white_alpha(235),
+    );
+
+    let time = ui.input(|i| i.time);
+    let bars = Rect::from_min_size(pos2(rect.right() - 58.0, rect.center().y - 18.0), vec2(38.0, 36.0));
+    level_bars(p, bars, 5, live, time, Color32::from_white_alpha(if live { 230 } else { 90 }));
+}
+
+struct TileSpec<'a> {
+    title: &'a str,
+    route: &'a str,
+    state: &'a str,
+    state_color: Color32,
+    on: bool,
+    active: bool,
+    icon: fn(&Painter, Rect, Color32),
+}
+
+/// One stream tile (icon, title, route, state, switch). Returns true when the switch was clicked.
+fn tile(ui: &mut Ui, rect: Rect, t: &TileSpec) -> bool {
+    let p = ui.painter();
+    let stroke = if t.active { TEAL.gamma_multiply(0.55) } else { CARD_STROKE };
+    p.rect(rect, CornerRadius::same(16), CARD, Stroke::new(1.0, stroke), StrokeKind::Inside);
+    let inner = rect.shrink(PAD);
+    badge(p, Rect::from_min_size(inner.min, vec2(40.0, 40.0)), t.on, t.icon);
+    p.text(pos2(inner.left(), inner.top() + 62.0), Align2::LEFT_CENTER, t.title, semibold(15.5), TEXT);
+    p.text(pos2(inner.left(), inner.top() + 82.0), Align2::LEFT_CENTER, t.route, FontId::proportional(12.5), MUTED);
+    let sy = inner.bottom() - 6.0;
+    p.circle_filled(pos2(inner.left() + 4.0, sy), 3.5, t.state_color);
+    p.text(pos2(inner.left() + 14.0, sy), Align2::LEFT_CENTER, t.state, FontId::proportional(12.5), t.state_color);
+
+    let sw = Rect::from_min_size(pos2(inner.right() - 44.0, inner.top() + 7.0), vec2(44.0, 26.0));
+    // a child UI that does not move the parent's cursor (the row was allocated by the caller)
+    toggle(&mut ui.new_child(UiBuilder::new().max_rect(sw)), t.on)
+}
+
+fn connected_cards(ui: &mut Ui, status: &Status, settings: &Settings, devices: &DeviceSummary) {
+    let sh = shared();
+
+    // the phone
+    card(ui, CARD, CARD_STROKE, |ui| {
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(vec2(44.0, 44.0), Sense::hover());
+            badge(ui.painter(), rect, true, icon_phone);
+            ui.add_space(4.0);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 1.0;
+                let name = status.peer_name.as_deref().unwrap_or("Телефон");
+                ui.label(RichText::new(name).font(semibold(16.5)).color(TEXT));
+                let path = status.path.map_or("Подключено", path_label);
+                ui.label(RichText::new(path).size(12.5).color(MUTED));
+            });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let galley = ui.painter().layout_no_wrap("В сети".into(), FontId::proportional(12.5), GREEN);
+                let (pill, _) = ui.allocate_exact_size(vec2(galley.size().x + 30.0, 26.0), Sense::hover());
+                let p = ui.painter();
+                p.rect_filled(pill, CornerRadius::same(13), GREEN.gamma_multiply(0.12));
+                p.circle_filled(pos2(pill.left() + 12.0, pill.center().y), 3.5, GREEN);
+                p.galley(pos2(pill.left() + 21.0, pill.center().y - galley.size().y / 2.0), galley, GREEN);
+            });
+        });
+    });
+
+    // the two streams
+    let (pc_state, pc_color) = if devices.default_is_cable {
+        ("Пауза: вывод в CABLE", AMBER)
+    } else if !settings.pc_audio_enabled {
+        ("Выключено", MUTED)
+    } else if status.pc_audio.active {
+        ("Передаётся", GREEN)
+    } else {
+        ("Тишина", MUTED)
+    };
+    let (mic_state, mic_color) = if devices.cable_render_id.is_none() {
+        ("Нужен VB-CABLE", AMBER)
+    } else if !settings.mic_enabled {
+        ("Выключено", MUTED)
+    } else if status.mic.active {
+        ("Передаётся", GREEN)
+    } else if status.mic_demanded {
+        ("Запрошен", AMBER)
+    } else {
+        ("Ждёт запись", MUTED)
+    };
+    let width = ui.available_width();
+    let (row, _) = ui.allocate_exact_size(vec2(width, TILE_H), Sense::hover());
+    let half = (width - GAP) / 2.0;
+    let left = Rect::from_min_size(row.min, vec2(half, TILE_H));
+    let right = Rect::from_min_size(pos2(row.left() + half + GAP, row.top()), vec2(half, TILE_H));
+    let pc = TileSpec {
+        title: "Звук ПК",
+        route: "Компьютер → телефон",
+        state: pc_state,
+        state_color: pc_color,
+        on: settings.pc_audio_enabled,
+        active: status.pc_audio.active,
+        icon: icon_speaker,
+    };
+    if tile(ui, left, &pc) {
+        sh.set_pc_audio(!settings.pc_audio_enabled);
+    }
+    let mic = TileSpec {
+        title: "Микрофон",
+        route: "Телефон → компьютер",
+        state: mic_state,
+        state_color: mic_color,
+        on: settings.mic_enabled,
+        active: status.mic.active,
+        icon: icon_mic,
+    };
+    if tile(ui, right, &mic) {
+        sh.set_mic(!settings.mic_enabled);
+    }
+
+    // numbers
+    card(ui, CARD, CARD_STROKE, |ui| {
+        // the playout buffer lives on the receiving side; here: link, outgoing rate and codec
+        let kbps: f32 = [&status.pc_audio, &status.mic].into_iter().filter(|s| s.active).map(|s| s.kbps).sum();
+        let cols: [(&str, String); 3] = [
+            ("Пинг", status.rtt_ms.map_or("—".into(), |r| format!("{r:.0} мс"))),
+            ("Поток", if kbps > 0.0 { format!("{kbps:.0} кбит/с") } else { "—".into() }),
+            ("Кодек", "Opus 48 кГц".into()),
+        ];
+        ui.columns(3, |cols_ui| {
+            for (ui, (title, value)) in cols_ui.iter_mut().zip(cols) {
+                ui.vertical_centered(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.label(RichText::new(value).font(semibold(16.0)).color(TEXT));
+                    ui.label(RichText::new(title).size(12.0).color(MUTED));
+                });
+            }
+        });
+    });
 }
 
 impl UiApp {
@@ -286,7 +600,7 @@ impl UiApp {
             let pixels: Vec<Color32> = code
                 .to_colors()
                 .into_iter()
-                .map(|c| if c == qrcode::Color::Dark { Color32::from_rgb(0x0E, 0x11, 0x16) } else { Color32::WHITE })
+                .map(|c| if c == qrcode::Color::Dark { BG } else { Color32::WHITE })
                 .collect();
             let image = egui::ColorImage::new([n, n], pixels);
             let tex = ctx.load_texture("pairing-qr", image, TextureOptions::NEAREST);
@@ -299,109 +613,66 @@ impl UiApp {
         let ctx = ui.ctx().clone();
         card(ui, CARD, CARD_STROKE, |ui| {
             ui.vertical_centered(|ui| {
-                ui.add_space(4.0);
-                let side = 244.0;
+                ui.label(RichText::new("Подключите телефон").font(semibold(18.0)).color(TEXT));
+                ui.add_space(2.0);
+                let side = 228.0;
                 let (rect, _) = ui.allocate_exact_size(vec2(side, side), Sense::hover());
                 match uri.and_then(|u| self.qr_texture(&ctx, u)) {
                     Some(tex) => {
                         let painter = ui.painter();
-                        painter.rect_filled(rect, CornerRadius::same(16), Color32::WHITE);
-                        let inner = rect.shrink(16.0);
+                        gradient_rect(painter, rect, 20.0, INDIGO, TEAL);
+                        let white = rect.shrink(4.0);
+                        painter.rect_filled(white, CornerRadius::same(16), Color32::WHITE);
+                        let inner = white.shrink(14.0);
                         painter.image(tex.id(), inner, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
                     }
                     None => {
-                        ui.painter().rect_filled(rect, CornerRadius::same(16), TOGGLE_OFF.gamma_multiply(0.4));
+                        ui.painter().rect_filled(rect, CornerRadius::same(18), TOGGLE_OFF.gamma_multiply(0.4));
                         ui.put(rect, egui::Spinner::new().size(28.0).color(MUTED));
                     }
                 }
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new("Отсканируйте QR-код в приложении AudioBridge на телефоне").size(15.0).color(TEXT),
-                );
-                ui.label(RichText::new(format!("Компьютер: {}", shared().pc_name)).size(12.5).color(MUTED));
+            });
+            ui.add_space(10.0);
+            let steps = [
+                "Установите AudioBridge на Android",
+                "Нажмите «Добавить компьютер»",
+                "Наведите камеру на этот QR-код",
+            ];
+            for (i, step) in steps.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::hover());
+                    let p = ui.painter();
+                    gradient_rect(p, r, 12.0, INDIGO, TEAL);
+                    p.text(r.center(), Align2::CENTER_CENTER, (i + 1).to_string(), semibold(12.5), Color32::WHITE);
+                    ui.add_space(2.0);
+                    ui.label(RichText::new(*step).size(13.5).color(TEXT));
+                });
+            }
+            ui.add_space(4.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new(format!("Этот компьютер: {}", shared().pc_name)).size(12.5).color(MUTED));
                 if !connected {
                     if let Some(err) = &status.last_error {
                         ui.label(RichText::new(err).size(12.0).color(RED));
                     }
                 }
-                if connected && ui.link(RichText::new("Назад").size(13.5).color(LINK)).clicked() {
+            });
+            if connected {
+                ui.add_space(4.0);
+                if wide_button(ui, "Назад", None) {
                     self.show_qr = false;
                 }
-            });
+            }
         });
     }
 }
 
-fn connected_cards(ui: &mut Ui, status: &Status, settings: &Settings, devices: &DeviceSummary) {
-    let sh = shared();
-    card(ui, CARD, CARD_STROKE, |ui| {
-        ui.horizontal(|ui| {
-            let (rect, _) = ui.allocate_exact_size(vec2(44.0, 44.0), Sense::hover());
-            let painter = ui.painter();
-            painter.circle_filled(rect.center(), 22.0, GREEN.gamma_multiply(0.18));
-            let phone = Rect::from_center_size(rect.center(), vec2(14.0, 22.0));
-            painter.rect_stroke(phone, CornerRadius::same(3), Stroke::new(2.0, GREEN), StrokeKind::Middle);
-            painter.circle_filled(pos2(phone.center().x, phone.bottom() - 3.5), 1.4, GREEN);
-            ui.add_space(6.0);
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 2.0;
-                let name = status.peer_name.as_deref().unwrap_or("Телефон");
-                ui.label(RichText::new(name).font(semibold(17.0)).color(TEXT));
-                let path = status.path.map_or("Подключено", path_label);
-                ui.label(RichText::new(path).size(13.0).color(MUTED));
-            });
-        });
-    });
-
-    card(ui, CARD, CARD_STROKE, |ui| {
-        let pc_sub = if devices.default_is_cable {
-            "Приостановлено: вывод в CABLE Input"
-        } else if status.pc_audio.active {
-            "Передаётся"
-        } else {
-            "Тишина"
-        };
-        if switch_row(ui, "Звук компьютера → телефон", Some(pc_sub), settings.pc_audio_enabled) {
-            sh.set_pc_audio(!settings.pc_audio_enabled);
+fn footer(ui: &mut Ui) {
+    ui.vertical_centered(|ui| {
+        let text = format!("v{} · open source на GitHub", env!("CARGO_PKG_VERSION"));
+        if ui.link(RichText::new(text).size(12.0).color(MUTED)).clicked() {
+            open_url(REPO_URL);
         }
-        ui.add_space(2.0);
-        let r = ui.available_rect_before_wrap();
-        ui.painter().hline(r.x_range(), r.top(), Stroke::new(1.0, CARD_STROKE));
-        ui.add_space(6.0);
-        let mic_sub = if devices.cable_render_id.is_none() {
-            "Нужен VB-CABLE"
-        } else if status.mic.active {
-            "Передаётся в CABLE Output"
-        } else if status.mic_demanded {
-            "Запрошен приложением"
-        } else {
-            "Включится, когда приложение начнёт запись"
-        };
-        if switch_row(ui, "Микрофон телефона → компьютер", Some(mic_sub), settings.mic_enabled) {
-            sh.set_mic(!settings.mic_enabled);
-        }
-    });
-
-    card(ui, CARD, CARD_STROKE, |ui| {
-        let buffer = [&status.pc_audio, &status.mic]
-            .iter()
-            .filter(|s| s.active && s.buffer_ms > 0.0)
-            .map(|s| s.buffer_ms)
-            .reduce(f32::max);
-        let cols: [(&str, String); 3] = [
-            ("Пинг", status.rtt_ms.map_or("—".into(), |r| format!("{r:.0} мс"))),
-            ("Буфер", buffer.map_or("—".into(), |b| format!("{b:.0} мс"))),
-            ("Канал", status.path.map_or("—", path_label).to_owned()),
-        ];
-        ui.columns(3, |cols_ui| {
-            for (ui, (title, value)) in cols_ui.iter_mut().zip(cols) {
-                ui.vertical_centered(|ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.label(RichText::new(title).size(12.0).color(MUTED));
-                    ui.add(egui::Label::new(RichText::new(value).size(14.0).color(TEXT)).wrap());
-                });
-            }
-        });
     });
 }
 

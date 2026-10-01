@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
         let mut n = 0u64;
         while !st.load(Ordering::Relaxed) {
             n += 1;
-            for f in buf.chunks_exact_mut(2) {
+            for f in buf.as_chunks_mut::<2>().0 {
                 f.fill((phase.sin() * 0.5) as f32);
                 phase += step;
             }
