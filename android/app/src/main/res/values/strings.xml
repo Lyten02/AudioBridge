@@ -13,6 +13,8 @@
     <string name="notif_mic_ready">Микрофон включён</string>
     <string name="notif_action_mic_on">Включить микрофон</string>
     <string name="notif_action_mic_off">Выключить микрофон</string>
+    <string name="notif_action_mute_all">Выключить звук</string>
+    <string name="notif_action_unmute_all">Включить звук</string>
 
     <!-- Paths -->
     <string name="path_lan">Локальная сеть</string>

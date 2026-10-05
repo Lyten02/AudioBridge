@@ -233,16 +233,19 @@ impl Hub {
         self.apply_muted(&self.peers.lock());
     }
 
-    /// Pushes the muted set to the peers' mixer slots and status entries.
+    /// Pushes the muted set to the peers' mixer slots and status entries. Unmuting restarts the
+    /// PC's stream, so the playout never replays audio queued before or during the mute.
     fn apply_muted(&self, current: &[PeerEntry]) {
         let muted = self.shared.muted.lock();
         for e in current {
             let on = muted.contains(&e.id);
-            e.peer
-                .rx()
-                .shared
-                .muted
-                .store(on, std::sync::atomic::Ordering::Relaxed);
+            let rx = e.peer.rx();
+            // Under the feeder lock, so no packet sees a half-applied change.
+            let mut feeder = rx.feeder.lock();
+            let was = rx.shared.muted.swap(on, std::sync::atomic::Ordering::Relaxed);
+            if was && !on {
+                feeder.reset();
+            }
         }
         self.shared.status.send_if_modified(|h| {
             let mut changed = false;

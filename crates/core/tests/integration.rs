@@ -441,6 +441,41 @@ async fn muted_pc_stays_connected_but_is_left_out_of_the_mix() {
     b.shutdown().await;
 }
 
+/// Android closes the output while every streaming PC is muted, so nobody pulls the playout
+/// (here: never, since the hub started). Unmuting must play fresh audio: no stale backlog, no
+/// added latency, no packets counted as lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unmuting_after_the_output_was_closed_plays_fresh_audio() {
+    init_logs();
+    let (da, dh) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = start_server(da.path(), "PC-A", NetOptions::local_only()).await;
+    let pa = pairing_of(&a);
+    let ida = pa.peer_id();
+    let hub = start_hub(dh.path(), Vec::new()).await;
+    hub.set_muted(vec![ida.clone()]);
+    hub.set_peers(vec![pa]);
+    let mut hs = hub.status();
+    wait_for(&mut hs, Duration::from_secs(10), "connected", |h| connected(h, &ida)).await;
+
+    let cap = capture_clock(a.pc_audio_capture(), 1000.0, 0.5, 350, Some(280));
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    hub.set_muted(Vec::new());
+    let out = playout_clock(hub.pc_audio_playout(), 150, 0.25);
+    let onset = join(cap).await.expect("loud onset pushed");
+    let rx = join(out).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let s = hub.status().borrow().peers[0].status.pc_audio.clone();
+    let latency = rx.first_loud.map(|t| t.saturating_duration_since(onset));
+    println!("after unmute: latency {latency:?}, {s:?}");
+    let latency = latency.expect("loud tone heard after unmute");
+    assert!(latency > Duration::ZERO && latency < Duration::from_millis(150), "latency {latency:?}");
+    assert!(s.lost_packets < 10, "muting must not count as loss: {s:?}");
+    assert!(s.buffer_ms < 150.0, "stale backlog: {s:?}");
+
+    hub.shutdown().await;
+    a.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn removing_a_pc_keeps_the_other_connection() {
     init_logs();
