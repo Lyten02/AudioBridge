@@ -47,7 +47,7 @@ impl Mixer {
                 if !p.needs_service() {
                     continue;
                 }
-                // A muted playout keeps running so its buffer and clock tracking stay current.
+                // A muted playout keeps running so it drains to silence (its feeder stops queueing).
                 p.fill_at(scratch, now);
                 let target = if p.is_muted() { 0.0 } else { 1.0 };
                 if !(p.is_audible() || scratch.iter().any(|s| *s != 0.0)) {
