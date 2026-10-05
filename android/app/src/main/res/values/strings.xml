@@ -38,6 +38,11 @@
     <string name="overview_audio_playing">Звук с ПК играет в наушниках</string>
     <string name="overview_audio_idle">Звук появится, как только ПК начнёт играть</string>
     <string name="overview_offline_hint">Подключимся автоматически, когда компьютер будет в сети</string>
+    <string name="overview_muted">Звук с ПК выключен на телефоне</string>
+    <string name="mute">Выключить звук</string>
+    <string name="unmute">Включить звук</string>
+    <string name="mute_all">Выключить звук всех ПК</string>
+    <string name="unmute_all">Включить звук всех ПК</string>
 
     <!-- Computers -->
     <string name="pcs_title">Компьютеры</string>
@@ -50,6 +55,7 @@
     <string name="stat_buffer">Буфер %1$d мс</string>
     <string name="stat_audio">Звук</string>
     <string name="stat_audio_off">Звук выключен на ПК</string>
+    <string name="stat_muted">Звук выключен на телефоне</string>
     <string name="mic_badge">микрофон используется</string>
     <string name="remove">Удалить</string>
     <string name="remove_title">Удалить %1$s?</string>

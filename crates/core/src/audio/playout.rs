@@ -256,6 +256,11 @@ impl Playout {
             || !self.queue.is_empty()
     }
 
+    /// The phone user muted this peer (the mixer drops its output).
+    pub(crate) fn is_muted(&self) -> bool {
+        self.shared.muted.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn fill(&mut self, out: &mut [f32]) {
         self.fill_at(out, Instant::now());
     }

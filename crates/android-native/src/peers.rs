@@ -1,9 +1,9 @@
-//! Pure handling of the `setPeers(urisJson)` argument.
+//! Pure handling of the `setPeers(urisJson)` / `setMuted(idsJson)` arguments.
 
 pub use audiobridge_core::session::MAX_PEERS;
 
-/// Parses the JSON array of pairing URIs sent by Kotlin.
-pub fn parse_uri_list(json: &str) -> Result<Vec<String>, String> {
+/// Parses a JSON array of strings sent by Kotlin (pairing URIs or peer ids).
+pub fn parse_string_list(json: &str) -> Result<Vec<String>, String> {
     serde_json::from_str::<Vec<String>>(json).map_err(|e| format!("expected a JSON array of strings: {e}"))
 }
 
@@ -28,11 +28,11 @@ mod tests {
 
     #[test]
     fn parses_array_and_rejects_other_json() {
-        assert_eq!(parse_uri_list(r#"["a","b"]"#).unwrap(), ["a", "b"]);
-        assert!(parse_uri_list("[]").unwrap().is_empty());
-        assert!(parse_uri_list(r#"{"a":1}"#).is_err());
-        assert!(parse_uri_list(r#"["a",1]"#).is_err());
-        assert!(parse_uri_list("").is_err());
+        assert_eq!(parse_string_list(r#"["a","b"]"#).unwrap(), ["a", "b"]);
+        assert!(parse_string_list("[]").unwrap().is_empty());
+        assert!(parse_string_list(r#"{"a":1}"#).is_err());
+        assert!(parse_string_list(r#"["a",1]"#).is_err());
+        assert!(parse_string_list("").is_err());
     }
 
     #[test]

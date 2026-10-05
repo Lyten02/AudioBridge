@@ -51,4 +51,19 @@ class PairedPcTest {
         assertEquals(listOf(lyten.uri, laptop.uri), List(array.length()) { array.getString(it) })
         assertEquals("[]", PairedPc.urisJson(emptyList()))
     }
+
+    @Test
+    fun mutedFlagRoundTripsAndDefaultsToUnmuted() {
+        val list = listOf(lyten.copy(muted = true), laptop)
+        assertEquals(list, PairedPc.decodeList(PairedPc.encodeList(list)))
+        // Lists stored before muting existed have no "muted" key.
+        assertEquals(listOf(lyten), PairedPc.decodeList("""[{"id":"id-1","name":"LYTEN","uri":"${lyten.uri}"}]"""))
+    }
+
+    @Test
+    fun mutedIdsJsonListsOnlyMutedPcs() {
+        val array = JSONArray(PairedPc.mutedIdsJson(listOf(lyten, laptop.copy(muted = true))))
+        assertEquals(listOf(laptop.id), List(array.length()) { array.getString(it) })
+        assertEquals("[]", PairedPc.mutedIdsJson(listOf(lyten, laptop)))
+    }
 }

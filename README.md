@@ -24,7 +24,7 @@ Pair once by scanning a QR code. After that both apps run in the background, sta
 - **Phone mic → PC.** Shows up as `CABLE Output` (VB-CABLE). The phone only sends the mic while some app on the PC is actually recording.
 - **One-scan pairing.** The PC shows a QR code, the phone scans it, and that's it.
 - **Works across networks.** Peer-to-peer over [iroh](https://iroh.computer) QUIC: LAN, NAT hole punching, Tailscale, or an encrypted relay as a last resort. The phone and the PC don't need to share a Wi-Fi network.
-- **Several PCs at once.** Pair up to 8 computers (desktop, laptop, …). Their audio is mixed, and the mic goes only to the ones that use it.
+- **Several PCs at once.** Pair up to 8 computers (desktop, laptop, …). Their audio is mixed, and the mic goes only to the ones that use it. Mute one PC, or all of them with a single button, right from the phone; they stay connected.
 - **Background and autostart** on both sides. Low CPU: about 1–2 % of one core on the PC, 4–5 % on the phone while playing.
 - **End-to-end encrypted** (QUIC/TLS) and authenticated by the pairing secret from the QR code.
 

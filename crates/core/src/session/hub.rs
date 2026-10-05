@@ -55,6 +55,8 @@ struct Shared {
     pc_audio: IncomingStream,
     mic: OutgoingStream,
     slot_busy: Mutex<[bool; SLOTS]>,
+    /// Peer ids muted on the phone (see [`Hub::set_muted`]); may name PCs not added yet.
+    muted: Mutex<Vec<String>>,
     cancel: CancellationToken,
     runtime: tokio::runtime::Handle,
 }
@@ -117,6 +119,7 @@ impl Hub {
             pc_audio: IncomingStream::new_mixed(StreamId::PcAudio, SLOTS)?,
             mic: OutgoingStream::new(StreamId::Mic, MIC_BITRATE, MIC_COMPLEXITY)?,
             slot_busy: Mutex::new([false; SLOTS]),
+            muted: Mutex::new(Vec::new()),
             cancel: CancellationToken::new(),
             runtime: tokio::runtime::Handle::current(),
         });
@@ -210,14 +213,48 @@ impl Hub {
                             peer_name: Some(e.peer.info.lock().pc_name().to_owned()),
                             ..Status::new()
                         },
+                        muted: false,
                     },
                 })
                 .collect();
             h.recompute();
         });
+        self.apply_muted(&current);
         for e in current.iter() {
             e.peer.refresh_toggles();
         }
+    }
+
+    /// Phone-side mute: the PCs whose peer id is in `ids` stay connected (mic included) but their
+    /// audio is left out of the mix, with a short ramp. Replaces the previous set; ids of PCs that
+    /// are not paired yet apply once they are added.
+    pub fn set_muted(&self, ids: Vec<String>) {
+        *self.shared.muted.lock() = ids;
+        self.apply_muted(&self.peers.lock());
+    }
+
+    /// Pushes the muted set to the peers' mixer slots and status entries.
+    fn apply_muted(&self, current: &[PeerEntry]) {
+        let muted = self.shared.muted.lock();
+        for e in current {
+            let on = muted.contains(&e.id);
+            e.peer
+                .rx()
+                .shared
+                .muted
+                .store(on, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.shared.status.send_if_modified(|h| {
+            let mut changed = false;
+            for p in &mut h.peers {
+                let on = muted.contains(&p.id);
+                changed |= std::mem::replace(&mut p.muted, on) != on;
+            }
+            if changed {
+                h.recompute();
+            }
+            changed
+        });
     }
 
     fn claim_slot(&self) -> Option<usize> {
@@ -228,6 +265,7 @@ impl Hub {
         rx.feeder.lock().reset();
         rx.shared.clear_stats();
         rx.shared.in_use.store(true, std::sync::atomic::Ordering::Release);
+        rx.shared.muted.store(false, std::sync::atomic::Ordering::Relaxed);
         Some(slot)
     }
 
@@ -486,8 +524,9 @@ impl Peer {
     }
 
     /// Keeps this phone's Wi-Fi out of power save while the PC's audio arrives: a tiny datagram
-    /// every 20 ms, but only while audio is streaming and the PC is not already receiving our
-    /// mic (which is uplink traffic itself). Sleeps (no timer) while there is no audio.
+    /// every 20 ms, but only while audio is streaming, is not muted on the phone and the PC is not
+    /// already receiving our mic (which is uplink traffic itself). Sleeps (no timer) while there
+    /// is no audio.
     async fn pace_loop(&self, conn: &Connection) {
         let mut pkt = [0u8; DATAGRAM_HEADER_LEN];
         DatagramHeader {
@@ -509,7 +548,9 @@ impl Peer {
                 if !self.rx().feeder.lock().is_streaming(Instant::now()) {
                     break;
                 }
-                if self.mic_stats.active.load(std::sync::atomic::Ordering::Relaxed) {
+                if self.mic_stats.active.load(std::sync::atomic::Ordering::Relaxed)
+                    || self.rx().shared.muted.load(std::sync::atomic::Ordering::Relaxed)
+                {
                     continue;
                 }
                 if conn.send_datagram(pkt.clone()).is_ok() {

@@ -16,7 +16,7 @@ Phone (Hub)  AAudio in ─► CaptureHandle ─► tx thread (Opus 64k, fan-out 
 PC (Server)  WASAPI render "CABLE Input" ◄─ PlayoutHandle (jitter buffer, decode in fill) ◄─ RxFeeder ◄──────────────┘
 ```
 - **Core (`audiobridge_core`)** is platform-neutral. Platforms touch audio only through `CaptureHandle::push` and `PlayoutHandle::fill`: 48 kHz f32 interleaved. Capture goes through an rtrb SPSC ring to the sender thread; received packets go through an rtrb SPSC packet queue into a jitter buffer that `fill` decodes on demand (NetEQ-lite: PLC/expand, p98 delay target, drift PI + Hermite resampler, WSOLA-style frame drops). Neither call allocates or locks (`tests/rt_alloc.rs` enforces this).
-  - **Real-time rule:** `push`, `fill`, `Playout::fill` and `Mixer::fill` must never allocate, lock or block. Mixer slots are preallocated; peers attach and detach via atomics; the sender is woken with `Thread::unpark`.
+  - **Real-time rule:** `push`, `fill`, `Playout::fill` and `Mixer::fill` must never allocate, lock or block. Mixer slots are preallocated; peers attach, detach and are muted via atomics; the sender is woken with `Thread::unpark`.
 - **Roles:** `session::Server` is the PC side; it serves one active phone and a new connection replaces the old one (close codes 1 = replaced, 2 = rejected, 3 = shutdown). `session::Hub` is the phone side: one iroh endpoint, one task per PC, `MAX_PEERS = 8`, `SLOTS = 16`.
 - **Dialing:** the phone always dials the PC, which works through NAT and double NAT.
 - **Control:** a single bi-stream carrying `ControlMsg` frames (`len u16 | tag | body`): Hello{secret} → Welcome/Reject, Toggles, MicDemand, MicAllowed.
@@ -26,6 +26,7 @@ PC (Server)  WASAPI render "CABLE Input" ◄─ PlayoutHandle (jitter buffer, de
   - Target buffer: p98 of an exponentially forgotten arrival-delay histogram, clamped 20–500 ms. Excess buffer is drained by WSOLA-style frame drops.
   - Clock drift: PI-controlled Hermite resampling, ±1 %.
 - **Hub backoff:** an offline PC is redialed 1 s → 30 s; `network_changed` retries immediately.
+- **Phone-side mute:** `Hub::set_muted(ids)` (Kotlin `NativeBridge.setMuted`, persisted as `muted` per entry in `paired_pcs`). A muted PC stays connected, keeps the mic and keeps streaming. The mixer still runs its playout but drops the output with a 10 ms gain ramp. It doesn't count toward `pc_audio_active`, so the output closes and the wake locks are released, and it gets no Pace packets. It's local to the phone: no wire/protocol change, so it works with any PC version.
 - **Status:** `tokio::sync::watch` (`Status` / `HubStatus`) via `StatusCell::update` → `send_if_modified`. Stats refresh at 2 Hz with change thresholds, so only real changes wake watchers. Keep this "notify on change" pattern; don't add polling.
 - **Desktop audio supervisor:**
   - Loopback runs only when `connected && pc_audio_enabled` and the default device is not a VB-CABLE device.
@@ -86,7 +87,7 @@ cargo ndk -t arm64-v8a clippy -p audiobridge-android --all-targets -- -D warning
   - Core `Server` API ↔ `crates/desktop`.
 - **Persisted state:**
   - PC: `%APPDATA%\AudioBridge` holds `server.key`, `pairing.secret`, `server.port`, `settings.json` and `pairing.txt`. Writes go through tmp+rename; corrupt files are regenerated. Changing `server.key` or `pairing.secret` breaks every existing pairing.
-  - Phone: `<filesDir>/audiobridge/client.key`, plus SharedPreferences `audiobridge` (`paired_pcs` JSON list, `mic_enabled`, `autostart_done`).
+  - Phone: `<filesDir>/audiobridge/client.key`, plus SharedPreferences `audiobridge` (`paired_pcs` JSON list of `{id, name, uri, muted}`, `mic_enabled`, `autostart_done`).
 - **Default UDP port:** 47130, falling back to a random port.
 - **Screenshots and releases:** the pairing QR contains the PC's secret. Never publish it; promo shots replace it with a QR of the repo URL. GitHub Releases ship `AudioBridge.exe` (the release build) and `AudioBridge.apk` (the debug-signed APK from this machine's `~/.android/debug.keystore`; a different key can't update an installed app).
 
@@ -126,7 +127,7 @@ cargo ndk -t arm64-v8a clippy -p audiobridge-android --all-targets -- -D warning
   - Core unit tests: proto, pairing, codec, tx gate, rx, the mixer limiter and persisted identity.
   - Playout simulations on a simulated clock (`audio/sim.rs`): jitter, power-save bursts, 2 % loss and ±0.15 % skew. They assert no exact-zero output runs and no skipped content.
   - `tests/rt_alloc.rs`: counts allocations and requires zero inside `push` and `fill`.
-  - `crates/core/tests/integration.rs`: a real Server + Hub in-process over `NetOptions::local_only()`, covering both directions plus latency < 60 ms, mixing from two PCs with mic routing, removing a PC, a wrong secret, reconnect, and uplink pacing. These tests are real-time and timing-sensitive; don't run them under heavy parallel load to judge flakiness.
+  - `crates/core/tests/integration.rs`: a real Server + Hub in-process over `NetOptions::local_only()`, covering both directions plus latency < 60 ms, mixing from two PCs with mic routing, muting PCs on the phone, removing a PC, a wrong secret, reconnect, and uplink pacing. These tests are real-time and timing-sensitive; don't run them under heavy parallel load to judge flakiness.
   - **On-device glitch check:** the phone logs `pc audio glitch: … underruns=… lost=…` and the PC logs `mic glitch: …` whenever counters grow. Compare screen-on vs screen-off with music playing.
   - android-native: host tests for the statusJson v2 schema, `NotifyGate` debounce, policies and peer parsing.
   - Android: JVM tests `BridgeStatusTest` and `PairedPcTest` (`isReturnDefaultValues = false`); there is no instrumented test.
