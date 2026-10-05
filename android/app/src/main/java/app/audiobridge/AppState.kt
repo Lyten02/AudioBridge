@@ -9,7 +9,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
-/** Persistent user state (paired PCs, mic toggle, dismissed setup steps), observable from the UI. */
+/** Persistent user state (paired PCs and their mute flags, mic toggle, dismissed setup steps), observable from the UI. */
 class Prefs private constructor(private val sp: SharedPreferences) {
     private val _pcs = MutableStateFlow(readPcs())
     val pcs: StateFlow<List<PairedPc>> = _pcs.asStateFlow()
@@ -41,12 +41,24 @@ class Prefs private constructor(private val sp: SharedPreferences) {
         _pcs.value = pcs
     }
 
-    /** Adds a PC, or replaces the one with the same id. */
+    /** Adds a PC, or replaces the one with the same id (keeping its mute setting). */
     @Synchronized
-    fun addPc(pc: PairedPc) = storePcs(PairedPc.upsert(_pcs.value, pc))
+    fun addPc(pc: PairedPc) {
+        val muted = _pcs.value.firstOrNull { it.id == pc.id }?.muted ?: pc.muted
+        storePcs(PairedPc.upsert(_pcs.value, pc.copy(muted = muted)))
+    }
 
     @Synchronized
     fun removePc(id: String) = storePcs(_pcs.value.filterNot { it.id == id })
+
+    /** Mutes or unmutes the audio of one PC on the phone. */
+    @Synchronized
+    fun setMuted(id: String, muted: Boolean) =
+        storePcs(_pcs.value.map { if (it.id == id) it.copy(muted = muted) else it })
+
+    /** Mutes or unmutes the audio of every paired PC on the phone. */
+    @Synchronized
+    fun setAllMuted(muted: Boolean) = storePcs(_pcs.value.map { it.copy(muted = muted) })
 
     fun setMicEnabled(on: Boolean) {
         sp.edit { putBoolean(KEY_MIC, on) }

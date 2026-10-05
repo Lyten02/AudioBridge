@@ -24,6 +24,8 @@ use crate::status::StatusView;
 pub enum Cmd {
     /// The full set of paired PCs (already deduplicated by peer id); empty = disconnect all.
     SetPeers(Vec<PairingInfo>),
+    /// Peer ids whose audio is muted on the phone (the full set; empty = none).
+    SetMuted(Vec<String>),
     MicAllowed(bool),
     NetworkChanged,
 }
@@ -78,6 +80,7 @@ pub fn init(vm: JavaVM, files_dir: &str, device_name: &str) -> Result<(), String
         listener: listener.clone(),
         published: StatusView::idle(),
         peers: Vec::new(),
+        muted: Vec::new(),
         hub: None,
         status_rx: None,
         status_closed: false,
@@ -126,6 +129,8 @@ struct Manager {
     listener: Listener,
     published: StatusView,
     peers: Vec<Peer>,
+    /// Muted peer ids, re-applied whenever a hub starts.
+    muted: Vec<String>,
     hub: Option<Hub>,
     status_rx: Option<watch::Receiver<HubStatus>>,
     status_closed: bool,
@@ -179,6 +184,13 @@ impl Manager {
                     self.try_start().await;
                 }
             }
+            Cmd::SetMuted(ids) => {
+                log::info!("muted PCs: {ids:?}");
+                self.muted = ids;
+                if let Some(hub) = &self.hub {
+                    hub.set_muted(self.muted.clone());
+                }
+            }
             Cmd::MicAllowed(allowed) => {
                 self.mic_allowed = allowed;
                 if let Some(hub) = &self.hub {
@@ -208,6 +220,7 @@ impl Manager {
         match Hub::start(cfg).await {
             Ok(hub) => {
                 hub.set_mic_enabled(self.mic_allowed);
+                hub.set_muted(self.muted.clone());
                 hub.set_peers(self.peer_infos());
                 let _ = self.audio.send(Event::Attach { playout: hub.pc_audio_playout(), capture: hub.mic_capture() });
                 self.audio_demand = None;

@@ -60,6 +60,9 @@ pub(crate) struct RxShared {
     pub(crate) flush: AtomicBool,
     /// Mixer slot assigned to a peer (hub only; unassigned slots are skipped once silent).
     pub(crate) in_use: AtomicBool,
+    /// The phone user muted this peer: the mixer keeps servicing its playout (so buffering
+    /// and clock tracking stay current) but leaves its audio out of the mix.
+    pub(crate) muted: AtomicBool,
 }
 
 impl RxShared {
@@ -75,6 +78,7 @@ impl RxShared {
             pace: AtomicU64::new(0),
             flush: AtomicBool::new(false),
             in_use: AtomicBool::new(false),
+            muted: AtomicBool::new(false),
         }
     }
 

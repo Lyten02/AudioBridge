@@ -365,6 +365,83 @@ async fn two_pcs_are_mixed_and_mic_goes_only_where_demanded() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn muted_pc_stays_connected_but_is_left_out_of_the_mix() {
+    init_logs();
+    let (da, db, dh) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let a = start_server(da.path(), "PC-A", NetOptions::local_only()).await;
+    let b = start_server(db.path(), "PC-B", NetOptions::local_only()).await;
+    let (pa, pb) = (pairing_of(&a), pairing_of(&b));
+    let (ida, idb) = (pa.peer_id(), pb.peer_id());
+    let hub = start_hub(dh.path(), Vec::new()).await;
+    // Muting before the PC is added applies once it is.
+    hub.set_muted(vec![idb.clone()]);
+    hub.set_peers(vec![pa, pb]);
+    let mut hs = hub.status();
+    wait_for(&mut hs, Duration::from_secs(10), "both connected, B muted", |h| {
+        connected(h, &ida)
+            && connected(h, &idb)
+            && h.peers.iter().any(|p| p.id == idb && p.muted)
+            && h.peers.iter().any(|p| p.id == ida && !p.muted)
+    })
+    .await;
+
+    // Phase 1 (4 s): B muted, A plays. Phase 2 (2 s): everything muted.
+    let cap_a = capture_clock(a.pc_audio_capture(), 1000.0, 0.4, 600, None);
+    let cap_b = capture_clock(b.pc_audio_capture(), 1500.0, 0.4, 600, None);
+    let out = playout_clock(hub.pc_audio_playout(), 600, 2.0);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let h = wait_for(&mut hs, Duration::from_secs(2), "both streams active", |h| {
+        h.peers.iter().all(|p| p.status.pc_audio.active)
+    })
+    .await;
+    assert!(h.pc_audio_active, "unmuted A keeps the output open");
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    hub.set_muted(vec![ida.clone(), idb.clone()]);
+    let h = hub.status().borrow().clone();
+    assert!(
+        !h.pc_audio_active && h.peers.iter().all(|p| p.status.pc_audio.active),
+        "audio still arrives but nothing needs the output: {h:?}"
+    );
+
+    join(cap_a).await;
+    join(cap_b).await;
+    let mixed = join(out).await;
+
+    // 2.0–3.5 s (first channel, 48 000 samples/s): only A is heard.
+    let first = &mixed.samples[2 * 48_000..7 * 24_000];
+    let (a1000, b1500) = (tone_amplitude(first, 1000.0), tone_amplitude(first, 1500.0));
+    println!("B muted: 1000 Hz {a1000:.3}, 1500 Hz {b1500:.3}");
+    assert!((a1000 - 0.4).abs() < 0.08, "PC-A tone amplitude {a1000}");
+    assert!(b1500 < 0.02, "muted PC-B must not be heard ({b1500})");
+    // Last second: silence, while both PCs keep streaming.
+    let last = &mixed.samples[mixed.samples.len() - 48_000..];
+    println!("all muted: rms {:.5}", rms(last));
+    assert_eq!(rms(last), 0.0, "all PCs muted");
+    let h = hub.status().borrow().clone();
+    assert!(connected(&h, &ida) && connected(&h, &idb), "muting keeps the connections");
+
+    // Unmuting brings the audio back without reconnecting.
+    hub.set_muted(Vec::new());
+    let cap_b = capture_clock(b.pc_audio_capture(), 1500.0, 0.4, 150, None);
+    let out = playout_clock(hub.pc_audio_playout(), 150, 2.0);
+    join(cap_b).await;
+    let rx = join(out).await;
+    let tail = &rx.samples[rx.samples.len() - 48_000..rx.samples.len() - 4_800];
+    let b1500 = tone_amplitude(tail, 1500.0);
+    println!("unmuted: 1500 Hz {b1500:.3}");
+    assert!((b1500 - 0.4).abs() < 0.08, "PC-B after unmute {b1500}");
+    assert!(hub.status().borrow().pc_audio_active);
+
+    hub.shutdown().await;
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn removing_a_pc_keeps_the_other_connection() {
     init_logs();
     let (da, db, dh) = (

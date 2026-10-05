@@ -145,7 +145,7 @@ pub extern "system" fn Java_app_audiobridge_NativeBridge_setPeers<'l>(
     guard("setPeers", (), || {
         let Some(engine) = engine_or_log("setPeers") else { return };
         let Some(json) = read_string(&mut env, &uris_json) else { return };
-        let uris = match peers::parse_uri_list(&json) {
+        let uris = match peers::parse_string_list(&json) {
             Ok(uris) => uris,
             Err(e) => {
                 log::error!("setPeers: {e}");
@@ -160,6 +160,24 @@ pub extern "system" fn Java_app_audiobridge_NativeBridge_setPeers<'l>(
             }
         });
         engine.send(Cmd::SetPeers(peers::dedupe(infos, PairingInfo::peer_id)));
+    })
+}
+
+/// `idsJson`: JSON array with the full set of muted peer ids; `[]` unmutes all PCs. A malformed array leaves the
+/// current set unchanged.
+#[no_mangle]
+pub extern "system" fn Java_app_audiobridge_NativeBridge_setMuted<'l>(
+    mut env: JNIEnv<'l>,
+    _this: JObject<'l>,
+    ids_json: JString<'l>,
+) {
+    guard("setMuted", (), || {
+        let Some(engine) = engine_or_log("setMuted") else { return };
+        let Some(json) = read_string(&mut env, &ids_json) else { return };
+        match peers::parse_string_list(&json) {
+            Ok(ids) => engine.send(Cmd::SetMuted(ids)),
+            Err(e) => log::error!("setMuted: {e}"),
+        }
     })
 }
 

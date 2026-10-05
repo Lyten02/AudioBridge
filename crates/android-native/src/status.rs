@@ -313,7 +313,7 @@ mod tests {
 
     fn hub(peers: Vec<(&str, Status)>) -> HubStatus {
         HubStatus {
-            peers: peers.into_iter().map(|(id, status)| PeerStatus { id: id.into(), status }).collect(),
+            peers: peers.into_iter().map(|(id, status)| PeerStatus { id: id.into(), status, muted: false }).collect(),
             mic_enabled: true,
             mic_wanted: false,
             pc_audio_active: true,

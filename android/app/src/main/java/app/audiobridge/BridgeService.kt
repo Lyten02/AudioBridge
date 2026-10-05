@@ -39,6 +39,9 @@ class BridgeService : Service() {
 
     /** Last JSON array handed to [NativeBridge.setPeers]. */
     private var appliedPeers: String? = null
+
+    /** Last JSON array handed to [NativeBridge.setMuted]. */
+    private var appliedMuted: String? = null
     private var fgsType = NOT_FOREGROUND
     private var shownNotificationKey: String? = null
 
@@ -87,6 +90,12 @@ class BridgeService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
+        // Mutes first, so a newly added muted PC never plays.
+        val muted = PairedPc.mutedIdsJson(pcs)
+        if (muted != appliedMuted) {
+            NativeBridge.setMuted(muted)
+            appliedMuted = muted
+        }
         val uris = PairedPc.urisJson(pcs)
         if (uris != appliedPeers) {
             NativeBridge.setPeers(uris)
@@ -100,6 +109,7 @@ class BridgeService : Service() {
         NativeBridge.setMicAllowed(false)
         NativeBridge.setPeers("[]")
         appliedPeers = null
+        appliedMuted = null
         networkCallback?.let { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it) }
         networkCallback = null
         main.removeCallbacksAndMessages(null)
