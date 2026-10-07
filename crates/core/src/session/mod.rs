@@ -111,6 +111,8 @@ pub struct PeerStatus {
     /// [`crate::pairing::PairingInfo::peer_id`].
     pub id: String,
     pub status: Status,
+    /// Muted on the phone ([`Hub::set_muted`]): stays connected, left out of the mix.
+    pub muted: bool,
 }
 
 /// Phone-side status: one entry per paired PC (in `set_peers` order) plus aggregates.
@@ -121,7 +123,7 @@ pub struct HubStatus {
     pub mic_enabled: bool,
     /// Some connected PC has the mic enabled and demanded: the phone should record.
     pub mic_wanted: bool,
-    /// Some PC's audio is arriving: the phone output should be open.
+    /// Some unmuted PC's audio is arriving: the phone output should be open.
     pub pc_audio_active: bool,
 }
 
@@ -130,7 +132,10 @@ impl HubStatus {
         self.mic_wanted = self.peers.iter().any(|p| {
             p.status.state == ConnState::Connected && p.status.mic_enabled && p.status.mic_demanded
         });
-        self.pc_audio_active = self.peers.iter().any(|p| p.status.pc_audio.active);
+        self.pc_audio_active = self
+            .peers
+            .iter()
+            .any(|p| p.status.pc_audio.active && !p.muted);
     }
 }
 

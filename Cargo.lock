@@ -196,7 +196,7 @@ dependencies = [
 
 [[package]]
 name = "audiobridge-android"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "android_logger",
  "audiobridge-core",
@@ -213,7 +213,7 @@ dependencies = [
 
 [[package]]
 name = "audiobridge-core"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "audiobridge-opus-sys",
@@ -233,7 +233,7 @@ dependencies = [
 
 [[package]]
 name = "audiobridge-desktop"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "audiobridge-core",
@@ -252,7 +252,7 @@ dependencies = [
 
 [[package]]
 name = "audiobridge-opus-sys"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "cc",
 ]

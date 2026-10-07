@@ -60,6 +60,9 @@ pub(crate) struct RxShared {
     pub(crate) flush: AtomicBool,
     /// Mixer slot assigned to a peer (hub only; unassigned slots are skipped once silent).
     pub(crate) in_use: AtomicBool,
+    /// The phone user muted this peer: the feeder stops queueing its audio and the mixer leaves
+    /// it out (with a ramp). Changed only under the feeder lock.
+    pub(crate) muted: AtomicBool,
 }
 
 impl RxShared {
@@ -75,6 +78,7 @@ impl RxShared {
             pace: AtomicU64::new(0),
             flush: AtomicBool::new(false),
             in_use: AtomicBool::new(false),
+            muted: AtomicBool::new(false),
         }
     }
 
@@ -101,6 +105,8 @@ pub(crate) struct RxFeeder {
     last_audio: Option<Instant>,
     silenced: bool,
     active: bool,
+    /// Muted: the Silence marker that ends the stream for the playout has been queued.
+    mute_marked: bool,
 }
 
 impl RxFeeder {
@@ -111,20 +117,26 @@ impl RxFeeder {
             last_audio: None,
             silenced: true,
             active: false,
+            mute_marked: false,
         }
     }
 
-    /// Starts a fresh stream (new connection or new owner).
+    /// Starts a fresh stream (new connection, new owner, or unmuted).
     pub(crate) fn reset(&mut self) {
         self.last_audio = None;
         self.silenced = true;
         self.active = false;
+        self.mute_marked = false;
         if !self.push(PktKind::Reset, 0, Instant::now(), &[]) {
             self.shared.flush.store(true, Ordering::Release);
         }
     }
 
     /// Handles one parsed audio/silence datagram. Returns `true` if `active` flipped to `true`.
+    ///
+    /// While muted, audio still counts for activity but is not queued: the output may be closed,
+    /// and an unread queue would replay stale audio after unmuting. One Silence marker ends the
+    /// stream cleanly for the playout; unmuting resets the feeder.
     pub(crate) fn on_packet(&mut self, hdr: DatagramHeader, payload: &[u8], now: Instant) -> bool {
         match hdr.kind {
             PacketKind::Audio => {
@@ -132,7 +144,11 @@ impl RxFeeder {
                     (payload.len() + DATAGRAM_HEADER_LEN) as u64,
                     Ordering::Relaxed,
                 );
-                self.push(PktKind::Audio, hdr.seq, now, payload);
+                if !self.shared.muted.load(Ordering::Relaxed) {
+                    self.push(PktKind::Audio, hdr.seq, now, payload);
+                } else if !self.mute_marked {
+                    self.mute_marked = self.push(PktKind::Silence, hdr.seq, now, &[]);
+                }
                 self.last_audio = Some(now);
                 self.silenced = false;
                 let became_active = !self.active;
@@ -140,7 +156,9 @@ impl RxFeeder {
                 became_active
             }
             PacketKind::Silence => {
-                self.push(PktKind::Silence, hdr.seq, now, &[]);
+                if !self.shared.muted.load(Ordering::Relaxed) {
+                    self.push(PktKind::Silence, hdr.seq, now, &[]);
+                }
                 self.silenced = true;
                 false
             }

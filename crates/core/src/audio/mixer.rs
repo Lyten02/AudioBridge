@@ -1,6 +1,6 @@
 //! Real-time mixer over a fixed set of per-peer playouts (each with its own jitter buffer and
-//! drift compensation). Slots are allocated once; peers are attached/detached through atomics,
-//! so `fill` never allocates, locks or frees.
+//! drift compensation). Slots are allocated once; peers are attached/detached and muted through
+//! atomics, so `fill` never allocates, locks or frees.
 
 use super::playout::Playout;
 
@@ -8,9 +8,13 @@ use super::playout::Playout;
 const SCRATCH_SAMPLES: usize = 2048;
 /// Soft limiter knee: below it the signal passes untouched.
 const KNEE: f32 = 0.8;
+/// Gain change per frame when a peer is muted or unmuted: a 10 ms linear ramp, no clicks.
+const RAMP_STEP: f32 = 1.0 / 480.0;
 
 pub(crate) struct Mixer {
     playouts: Vec<Playout>,
+    /// Current gain of each playout: 1 = playing, 0 = muted, ramping in between.
+    gains: Vec<f32>,
     scratch: Vec<f32>,
     channels: usize,
 }
@@ -19,6 +23,7 @@ impl Mixer {
     pub(crate) fn new(channels: usize, playouts: Vec<Playout>) -> Self {
         debug_assert!(playouts.iter().all(|p| p.channels() == channels));
         Self {
+            gains: vec![1.0; playouts.len()],
             playouts,
             scratch: vec![0.0; SCRATCH_SAMPLES],
             channels,
@@ -38,12 +43,35 @@ impl Mixer {
             chunk.fill(0.0);
             let scratch = &mut self.scratch[..chunk.len()];
             let mut sources = 0;
-            for p in self.playouts.iter_mut().filter(|p| p.needs_service()) {
+            for (p, gain) in self.playouts.iter_mut().zip(self.gains.iter_mut()) {
+                if !p.needs_service() {
+                    continue;
+                }
+                // A muted playout keeps running so it drains to silence (its feeder stops queueing).
                 p.fill_at(scratch, now);
-                if p.is_audible() || scratch.iter().any(|s| *s != 0.0) {
-                    sources += 1;
+                let target = if p.is_muted() { 0.0 } else { 1.0 };
+                if !(p.is_audible() || scratch.iter().any(|s| *s != 0.0)) {
+                    *gain = target;
+                    continue;
+                }
+                if *gain == 0.0 && target == 0.0 {
+                    continue;
+                }
+                sources += 1;
+                if *gain == target {
                     for (o, s) in chunk.iter_mut().zip(scratch.iter()) {
                         *o += *s;
+                    }
+                } else {
+                    for (o, s) in chunk.chunks_exact_mut(ch).zip(scratch.chunks_exact(ch)) {
+                        *gain = if target > *gain {
+                            (*gain + RAMP_STEP).min(target)
+                        } else {
+                            (*gain - RAMP_STEP).max(target)
+                        };
+                        for (o, s) in o.iter_mut().zip(s) {
+                            *o += *s * *gain;
+                        }
                     }
                 }
             }

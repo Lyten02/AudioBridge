@@ -98,6 +98,8 @@ class MainActivity : ComponentActivity() {
                     snackbarHostState = snackbar,
                     onAddPc = ::scan,
                     onRemovePc = ::removePc,
+                    onMutePc = ::setPcMuted,
+                    onMuteAll = ::setAllMuted,
                     onMicToggle = ::setMic,
                     onPcControl = ::controlPc,
                 )
@@ -165,6 +167,16 @@ class MainActivity : ComponentActivity() {
     private fun removePc(id: String) {
         prefs.removePc(id)
         if (prefs.pcs.value.isEmpty()) BridgeService.stop(this) else startBridge()
+    }
+
+    private fun setPcMuted(id: String, muted: Boolean) {
+        prefs.setMuted(id, muted)
+        startBridge()
+    }
+
+    private fun setAllMuted(muted: Boolean) {
+        prefs.setAllMuted(muted)
+        startBridge()
     }
 
     /** (Re)starts the service so it picks up the current PC list and, being visible, may add the mic FGS type. */

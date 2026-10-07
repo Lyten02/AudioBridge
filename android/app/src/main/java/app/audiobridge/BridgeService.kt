@@ -46,6 +46,9 @@ class BridgeService : Service() {
 
     /** Last JSON array handed to [NativeBridge.setPeers]. */
     private var appliedPeers: String? = null
+
+    /** Last JSON array handed to [NativeBridge.setMuted]. */
+    private var appliedMuted: String? = null
     private var fgsType = NOT_FOREGROUND
     private var shownNotificationKey: String? = null
 
@@ -101,6 +104,8 @@ class BridgeService : Service() {
         when (intent?.action) {
             ACTION_ENABLE_MIC -> prefs.setMicEnabled(true)
             ACTION_DISABLE_MIC -> prefs.setMicEnabled(false)
+            ACTION_MUTE_ALL -> prefs.setAllMuted(true)
+            ACTION_UNMUTE_ALL -> prefs.setAllMuted(false)
         }
         val promote = intent?.action == ACTION_FOREGROUND || intent?.action == ACTION_ENABLE_MIC
         if (!updateForeground(promote)) {
@@ -112,6 +117,13 @@ class BridgeService : Service() {
         if (pcs.isEmpty()) {
             stopSelf()
             return START_NOT_STICKY
+        }
+        // Mutes first, so a newly added muted PC never plays.
+        val muted = PairedPc.mutedIdsJson(pcs)
+        if (muted != appliedMuted) {
+            NativeBridge.setMuted(muted)
+            appliedMuted = muted
+            refreshNotification(force = false)
         }
         val uris = PairedPc.urisJson(pcs)
         if (uris != appliedPeers) {
@@ -127,6 +139,7 @@ class BridgeService : Service() {
         NativeBridge.setMicState(false, false)
         NativeBridge.setPeers("[]")
         appliedPeers = null
+        appliedMuted = null
         networkCallback?.let { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it) }
         networkCallback = null
         main.removeCallbacksAndMessages(null)
@@ -347,7 +360,9 @@ class BridgeService : Service() {
     }
 
     private fun notificationKey(status: BridgeStatus, micReady: Boolean): String =
-        "${notificationText(status)}|$micReady|${status.micCapturing}|${prefs.micEnabled.value}|${hasRecordAudio()}"
+        "${notificationText(status)}|$micReady|${status.micCapturing}|${prefs.micEnabled.value}|${hasRecordAudio()}|${allMuted()}"
+
+    private fun allMuted(): Boolean = prefs.pcs.value.let { pcs -> pcs.isNotEmpty() && pcs.all { it.muted } }
 
     private fun refreshNotification(force: Boolean) {
         val status = StatusHub.status.value
@@ -405,6 +420,11 @@ class BridgeService : Service() {
             else -> Unit
         }
 
+        if (allMuted()) {
+            builder.addAction(R.drawable.ic_volume_up, getString(R.string.notif_action_unmute_all), servicePendingIntent(ACTION_UNMUTE_ALL, 5))
+        } else {
+            builder.addAction(R.drawable.ic_volume_off, getString(R.string.notif_action_mute_all), servicePendingIntent(ACTION_MUTE_ALL, 4))
+        }
         if (micOn) {
             builder.addAction(
                 R.drawable.ic_mic,
@@ -450,6 +470,8 @@ class BridgeService : Service() {
         const val ACTION_FOREGROUND = "app.audiobridge.action.FOREGROUND"
         const val ACTION_ENABLE_MIC = "app.audiobridge.action.ENABLE_MIC"
         const val ACTION_DISABLE_MIC = "app.audiobridge.action.DISABLE_MIC"
+        const val ACTION_MUTE_ALL = "app.audiobridge.action.MUTE_ALL"
+        const val ACTION_UNMUTE_ALL = "app.audiobridge.action.UNMUTE_ALL"
 
         private val BASE_TYPE =
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE else 0

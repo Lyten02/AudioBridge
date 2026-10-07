@@ -117,6 +117,8 @@ fun MainScreen(
     snackbarHostState: SnackbarHostState,
     onAddPc: () -> Unit,
     onRemovePc: (String) -> Unit,
+    onMutePc: (id: String, muted: Boolean) -> Unit,
+    onMuteAll: (muted: Boolean) -> Unit,
     onMicToggle: (Boolean) -> Unit,
     /** Remote control of a connected PC: `NativeBridge.PC_*` action and its value. */
     onPcControl: (pcId: String, action: Int, value: Int) -> Unit,
@@ -145,7 +147,7 @@ fun MainScreen(
             if (rows.isEmpty()) {
                 Onboarding(onAddPc)
             } else {
-                OverviewCard(rows, status)
+                OverviewCard(rows, status, onMuteAll)
                 MicCard(rows, status, mic, onMicToggle)
                 SectionHeader(stringResource(R.string.pcs_title), rows.size)
                 rows.forEach { row ->
@@ -154,6 +156,7 @@ fun MainScreen(
                             row,
                             onRemove = { removeId = row.pc.id },
                             onControl = { action, value -> onPcControl(row.pc.id, action, value) },
+                            onMute = { onMutePc(row.pc.id, !row.pc.muted) },
                         )
                     }
                 }
@@ -244,9 +247,9 @@ private fun reachabilityText(reach: Reachability): Int = when (reach) {
     Reachability.Offline -> R.string.state_offline
 }
 
-/** Big summary: how many PCs are connected and whether audio is playing. */
+/** Big summary: how many PCs are connected and whether audio is playing, plus one button that mutes every PC. */
 @Composable
-private fun OverviewCard(rows: List<PcRow>, status: BridgeStatus) {
+private fun OverviewCard(rows: List<PcRow>, status: BridgeStatus, onMuteAll: (Boolean) -> Unit) {
     val connected = rows.count { it.reachability == Reachability.Connected }
     val connecting = rows.any { it.reachability == Reachability.Connecting }
     val overall = when {
@@ -260,11 +263,18 @@ private fun OverviewCard(rows: List<PcRow>, status: BridgeStatus) {
         connecting -> stringResource(R.string.overview_connecting)
         else -> stringResource(R.string.overview_offline)
     }
+    val allMuted = rows.all { it.pc.muted }
     val playing = connected > 0 && status.pcAudioActive
     val subtitle = when {
+        allMuted -> R.string.overview_muted
         playing -> R.string.overview_audio_playing
         overall == Reachability.Connected -> R.string.overview_audio_idle
         else -> R.string.overview_offline_hint
+    }
+    val muteLabel = when {
+        rows.size == 1 -> if (allMuted) R.string.unmute else R.string.mute
+        allMuted -> R.string.unmute_all
+        else -> R.string.mute_all
     }
     val accent by animateColorAsState(reachabilityColor(overall), label = "overviewColor")
     val scheme = MaterialTheme.colorScheme
@@ -280,39 +290,55 @@ private fun OverviewCard(rows: List<PcRow>, status: BridgeStatus) {
                 .background(Brush.linearGradient(listOf(scheme.primaryContainer, scheme.surfaceContainerHigh)))
                 .padding(24.dp),
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Box(
-                    Modifier.size(64.dp).clip(CircleShape).background(scheme.surface.copy(alpha = 0.35f)),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    if (playing) {
-                        Equalizer(scheme.onPrimaryContainer)
-                    } else {
-                        Icon(
-                            painterResource(R.drawable.ic_headphones),
-                            contentDescription = null,
-                            tint = scheme.onPrimaryContainer,
-                            modifier = Modifier.size(30.dp),
+            Column {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        Modifier.size(64.dp).clip(CircleShape).background(scheme.surface.copy(alpha = 0.35f)),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        if (playing) {
+                            Equalizer(scheme.onPrimaryContainer)
+                        } else {
+                            Icon(
+                                painterResource(if (allMuted) R.drawable.ic_volume_off else R.drawable.ic_headphones),
+                                contentDescription = null,
+                                tint = scheme.onPrimaryContainer,
+                                modifier = Modifier.size(30.dp),
+                            )
+                        }
+                    }
+                    Spacer(Modifier.width(18.dp))
+                    Column(Modifier.weight(1f)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            StatusDot(accent, pulsing = overall == Reachability.Connecting, size = 10)
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                title,
+                                style = MaterialTheme.typography.headlineSmall,
+                                color = scheme.onPrimaryContainer,
+                            )
+                        }
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            stringResource(subtitle),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = scheme.onPrimaryContainer.copy(alpha = 0.8f),
                         )
                     }
                 }
-                Spacer(Modifier.width(18.dp))
-                Column(Modifier.weight(1f)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        StatusDot(accent, pulsing = overall == Reachability.Connecting, size = 10)
-                        Spacer(Modifier.width(8.dp))
-                        Text(
-                            title,
-                            style = MaterialTheme.typography.headlineSmall,
-                            color = scheme.onPrimaryContainer,
-                        )
-                    }
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        stringResource(subtitle),
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = scheme.onPrimaryContainer.copy(alpha = 0.8f),
+                Spacer(Modifier.height(18.dp))
+                FilledTonalButton(
+                    onClick = { onMuteAll(!allMuted) },
+                    modifier = Modifier.fillMaxWidth().height(52.dp),
+                    shape = RoundedCornerShape(18.dp),
+                ) {
+                    Icon(
+                        painterResource(if (allMuted) R.drawable.ic_volume_up else R.drawable.ic_volume_off),
+                        contentDescription = null,
+                        modifier = Modifier.size(20.dp),
                     )
+                    Spacer(Modifier.width(10.dp))
+                    Text(stringResource(muteLabel), style = MaterialTheme.typography.labelLarge)
                 }
             }
         }
@@ -368,7 +394,7 @@ private fun SectionHeader(title: String, count: Int) {
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun PcCard(row: PcRow, onRemove: () -> Unit, onControl: (action: Int, value: Int) -> Unit) {
+private fun PcCard(row: PcRow, onRemove: () -> Unit, onMute: () -> Unit, onControl: (action: Int, value: Int) -> Unit) {
     val reach = row.reachability
     val color by animateColorAsState(reachabilityColor(reach), label = "pcColor")
     val peer = row.peer
@@ -413,6 +439,13 @@ private fun PcCard(row: PcRow, onRemove: () -> Unit, onControl: (action: Int, va
                         )
                     }
                 }
+                IconButton(onClick = onMute) {
+                    Icon(
+                        painterResource(if (row.pc.muted) R.drawable.ic_volume_off else R.drawable.ic_volume_up),
+                        contentDescription = stringResource(if (row.pc.muted) R.string.unmute else R.string.mute),
+                        tint = if (row.pc.muted) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
                 IconButton(onClick = onRemove) {
                     Icon(
                         painterResource(R.drawable.ic_delete),
@@ -431,6 +464,7 @@ private fun PcCard(row: PcRow, onRemove: () -> Unit, onControl: (action: Int, va
                 ) {
                     peer.rttMs?.let { Chip(stringResource(R.string.stat_ping, it.roundToInt())) }
                     when {
+                        row.pc.muted -> Chip(stringResource(R.string.stat_muted), emphasized = true)
                         !peer.pcAudioEnabled -> Chip(stringResource(R.string.stat_audio_off))
                         peer.pcAudio.active -> {
                             Chip(stringResource(R.string.stat_audio), emphasized = true)

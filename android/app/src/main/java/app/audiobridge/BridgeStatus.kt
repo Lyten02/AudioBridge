@@ -140,8 +140,11 @@ data class BridgeStatus(
     }
 }
 
-/** A paired PC as persisted on the phone. [id] is the stable peer id from the pairing QR. */
-data class PairedPc(val id: String, val name: String, val uri: String) {
+/**
+ * A paired PC as persisted on the phone. [id] is the stable peer id from the pairing QR; [muted] means its audio is
+ * not played on the phone (the connection and the mic keep working).
+ */
+data class PairedPc(val id: String, val name: String, val uri: String, val muted: Boolean = false) {
     companion object {
         /** Builds a PC from a scanned [uri] and the JSON returned by [NativeBridge.parsePairing]; null if invalid. */
         fun fromParseResult(uri: String, parseResult: String?): PairedPc? {
@@ -156,7 +159,9 @@ data class PairedPc(val id: String, val name: String, val uri: String) {
         }
 
         fun encodeList(pcs: List<PairedPc>): String = JSONArray().apply {
-            pcs.forEach { put(JSONObject().put("id", it.id).put("name", it.name).put("uri", it.uri)) }
+            pcs.forEach {
+                put(JSONObject().put("id", it.id).put("name", it.name).put("uri", it.uri).put("muted", it.muted))
+            }
         }.toString()
 
         /** Decodes a stored list; malformed entries are skipped and duplicates by id collapse to the last one. */
@@ -173,7 +178,7 @@ data class PairedPc(val id: String, val name: String, val uri: String) {
                 val id = o.optString("id")
                 val uri = o.optString("uri")
                 if (id.isEmpty() || uri.isEmpty()) continue
-                result = upsert(result, PairedPc(id, o.optString("name"), uri))
+                result = upsert(result, PairedPc(id, o.optString("name"), uri, o.optBoolean("muted")))
             }
             return result
         }
@@ -186,6 +191,10 @@ data class PairedPc(val id: String, val name: String, val uri: String) {
 
         /** The JSON array of URIs passed to [NativeBridge.setPeers]. */
         fun urisJson(pcs: List<PairedPc>): String = JSONArray().apply { pcs.forEach { put(it.uri) } }.toString()
+
+        /** The JSON array of muted PC ids passed to [NativeBridge.setMuted]. */
+        fun mutedIdsJson(pcs: List<PairedPc>): String =
+            JSONArray().apply { pcs.filter { it.muted }.forEach { put(it.id) } }.toString()
     }
 }
 

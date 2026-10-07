@@ -15,6 +15,9 @@ object NativeBridge {
     /** Sets the full set of PCs to stay connected to (JSON array of pairing URIs); `[]` disconnects all. */
     external fun setPeers(urisJson: String)
 
+    /** Sets the full set of PC ids whose audio is muted on the phone (JSON array of ids); `[]` unmutes all. */
+    external fun setMuted(idsJson: String)
+
     /**
      * Phone mic state: [enabled] = the user's mic switch; [ready] = RECORD_AUDIO is granted and the service holds FGS
      * type microphone. Native capture needs both; PCs see both.
