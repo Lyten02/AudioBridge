@@ -11,6 +11,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.database.ContentObserver
+import android.media.AudioManager
 import android.net.ConnectivityManager
 import android.net.LinkProperties
 import android.net.Network
@@ -20,22 +22,27 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
+import android.provider.Settings
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
+import kotlin.math.roundToInt
 
 /**
  * Keeps the native client connected in the background.
  *
  * Starts with FGS type connectedDevice only (allowed from BOOT_COMPLETED and background restarts). The microphone
  * type is added only from a while-in-use context: the visible activity ([ACTION_FOREGROUND]) or the user tapping the
- * notification action ([ACTION_ENABLE_MIC]). Native mic capture is allowed only while that type is held.
+ * notification action ([ACTION_ENABLE_MIC]). Once held it is kept whenever RECORD_AUDIO is granted, independent of the
+ * user's mic switch, so a PC can switch the mic on remotely in the background ([StatusListener.onRemoteMic]). Native
+ * mic capture needs both the switch and the type ([NativeBridge.setMicState]).
  */
 class BridgeService : Service() {
     private val main = Handler(Looper.getMainLooper())
     private lateinit var prefs: Prefs
     private lateinit var notifications: NotificationManager
+    private lateinit var audio: AudioManager
 
     /** Last JSON array handed to [NativeBridge.setPeers]. */
     private var appliedPeers: String? = null
@@ -45,6 +52,14 @@ class BridgeService : Service() {
     private var wifiLock: WifiManager.WifiLock? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+
+    /** Last media volume percent handed to [NativeBridge.setVolume]. */
+    private var reportedVolume: Int? = null
+
+    /** Volume changes are persisted to Settings.System: the public change signal for STREAM_MUSIC. */
+    private val volumeObserver = object : ContentObserver(main) {
+        override fun onChange(selfChange: Boolean) = reportVolume()
+    }
 
     private val statusListener = object : StatusListener {
         override fun onStatus(json: String) {
@@ -57,6 +72,14 @@ class BridgeService : Service() {
             StatusHub.status.value = status
             main.post { onStatusChanged(status) }
         }
+
+        override fun onRemoteMic(enabled: Boolean) {
+            main.post { applyRemoteMic(enabled) }
+        }
+
+        override fun onRemoteVolume(percent: Int) {
+            main.post { applyRemoteVolume(percent) }
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -65,9 +88,12 @@ class BridgeService : Service() {
         super.onCreate()
         prefs = Prefs.get(this)
         notifications = getSystemService(NotificationManager::class.java)
+        audio = getSystemService(AudioManager::class.java)
         createChannel()
         Native.ensureInit(this)
         NativeBridge.setListener(statusListener)
+        contentResolver.registerContentObserver(Settings.System.CONTENT_URI, true, volumeObserver)
+        reportVolume()
         registerNetworkCallback()
     }
 
@@ -96,13 +122,16 @@ class BridgeService : Service() {
     }
 
     override fun onDestroy() {
+        contentResolver.unregisterContentObserver(volumeObserver)
         NativeBridge.setListener(null)
-        NativeBridge.setMicAllowed(false)
+        NativeBridge.setMicState(false, false)
         NativeBridge.setPeers("[]")
         appliedPeers = null
         networkCallback?.let { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it) }
         networkCallback = null
         main.removeCallbacksAndMessages(null)
+        // Callbacks the native thread posts from now on must not touch the stopped service.
+        fgsType = NOT_FOREGROUND
         setStreamingLocks(false)
         StatusHub.status.value = BridgeStatus.IDLE
         StatusHub.micForeground.value = false
@@ -117,7 +146,8 @@ class BridgeService : Service() {
      * the microphone type. Returns false if the service could not become foreground at all.
      */
     private fun updateForeground(promote: Boolean): Boolean {
-        val wantMic = prefs.micEnabled.value && hasRecordAudio()
+        // Kept regardless of the user's switch: a PC may switch the mic on while the app is in the background.
+        val wantMic = hasRecordAudio()
         val holdsMic = fgsType != NOT_FOREGROUND && (fgsType and MIC_TYPE) == MIC_TYPE
         val desired = if (wantMic && (promote || holdsMic)) BASE_TYPE or MIC_TYPE else BASE_TYPE
 
@@ -145,7 +175,7 @@ class BridgeService : Service() {
         } else {
             refreshNotification(force = true)
         }
-        applyMicAllowed()
+        applyMicState()
         return true
     }
 
@@ -155,18 +185,27 @@ class BridgeService : Service() {
         shownNotificationKey = notificationKey(StatusHub.status.value, isMicType(type))
     }
 
+    /** [type] includes the microphone FGS type and RECORD_AUDIO is granted: the phone may record (mic ready). */
     private fun isMicType(type: Int): Boolean =
-        type != NOT_FOREGROUND && (type and MIC_TYPE) == MIC_TYPE && prefs.micEnabled.value && hasRecordAudio()
+        type != NOT_FOREGROUND && (type and MIC_TYPE) == MIC_TYPE && hasRecordAudio()
 
-    private fun applyMicAllowed() {
-        val allowed = isMicType(fgsType)
-        StatusHub.micForeground.value = allowed
-        NativeBridge.setMicAllowed(allowed)
+    private fun applyMicState() {
+        val ready = isMicType(fgsType)
+        StatusHub.micForeground.value = ready
+        NativeBridge.setMicState(prefs.micEnabled.value, ready)
     }
 
     private fun revokeMic() {
         StatusHub.micForeground.value = false
-        NativeBridge.setMicAllowed(false)
+        NativeBridge.setMicState(prefs.micEnabled.value, false)
+    }
+
+    /** A PC switched the phone mic: same as the user's switch (the microphone type is never added from here). */
+    private fun applyRemoteMic(on: Boolean) {
+        if (fgsType == NOT_FOREGROUND) return
+        Log.i(TAG, "mic switched ${if (on) "on" else "off"} by a PC")
+        prefs.setMicEnabled(on)
+        updateForeground(promote = false)
     }
 
     private fun onStatusChanged(status: BridgeStatus) {
@@ -252,6 +291,47 @@ class BridgeService : Service() {
 
     // endregion
 
+    // region volume
+
+    private fun streamMinVolume(): Int =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) audio.getStreamMinVolume(AudioManager.STREAM_MUSIC) else 0
+
+    /** Media (STREAM_MUSIC) volume in percent of its range; -1 if it cannot be read or changed. */
+    private fun mediaVolumePercent(): Int {
+        val min = streamMinVolume()
+        val max = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        if (audio.isVolumeFixed || max <= min) return -1
+        val index = audio.getStreamVolume(AudioManager.STREAM_MUSIC)
+        return ((index - min) * 100f / (max - min)).roundToInt().coerceIn(0, 100)
+    }
+
+    /** Reports the media volume to native (and so to every PC) when it changed. */
+    private fun reportVolume() {
+        val percent = mediaVolumePercent()
+        if (percent == reportedVolume) return
+        reportedVolume = percent
+        NativeBridge.setVolume(percent)
+    }
+
+    /** A PC set the phone's media volume, in percent. */
+    private fun applyRemoteVolume(percent: Int) {
+        if (fgsType == NOT_FOREGROUND) return
+        val min = streamMinVolume()
+        val max = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        val index = (min + (max - min) * percent.coerceIn(0, 100) / 100f).roundToInt()
+        try {
+            audio.setStreamVolume(AudioManager.STREAM_MUSIC, index, 0)
+        } catch (e: SecurityException) {
+            // Do Not Disturb policy may refuse volume changes.
+            Log.w(TAG, "media volume change refused", e)
+            return
+        }
+        // Settings.System is written with a delay; report the new level right away.
+        reportVolume()
+    }
+
+    // endregion
+
     // region notification
 
     private fun createChannel() {
@@ -317,13 +397,15 @@ class BridgeService : Service() {
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
 
+        // The switch is on and the phone may record: offer "mic off"; otherwise "mic on".
+        val micOn = micReady && prefs.micEnabled.value
         when {
-            micReady && status.micCapturing -> builder.setSubText(getString(R.string.notif_mic_live))
-            micReady -> builder.setSubText(getString(R.string.notif_mic_ready))
+            micOn && status.micCapturing -> builder.setSubText(getString(R.string.notif_mic_live))
+            micOn -> builder.setSubText(getString(R.string.notif_mic_ready))
             else -> Unit
         }
 
-        if (micReady) {
+        if (micOn) {
             builder.addAction(
                 R.drawable.ic_mic,
                 getString(R.string.notif_action_mic_off),

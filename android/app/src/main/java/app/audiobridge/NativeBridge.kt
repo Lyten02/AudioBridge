@@ -15,13 +15,35 @@ object NativeBridge {
     /** Sets the full set of PCs to stay connected to (JSON array of pairing URIs); `[]` disconnects all. */
     external fun setPeers(urisJson: String)
 
-    /** True only when RECORD_AUDIO is granted, the service holds FGS type microphone and the user toggle is on. */
-    external fun setMicAllowed(allowed: Boolean)
+    /**
+     * Phone mic state: [enabled] = the user's mic switch; [ready] = RECORD_AUDIO is granted and the service holds FGS
+     * type microphone. Native capture needs both; PCs see both.
+     */
+    external fun setMicState(enabled: Boolean, ready: Boolean)
+
+    /** Phone media volume in percent (0..100) reported to the PCs; -1 = unknown. */
+    external fun setVolume(percent: Int)
+
+    /**
+     * Remote control of the connected PC [peerId]: [action] is one of the `PC_*` constants, [value] is 0/1 for the
+     * switches and 0..100 for [PC_VOLUME]. Dropped (logged) if that PC is not connected.
+     */
+    external fun controlPc(peerId: String, action: Int, value: Int)
 
     external fun networkChanged()
 
     external fun statusJson(): String
 
-    /** Native calls [StatusListener.onStatus] on each status change (debounced ≥250 ms) from a native thread. */
+    /**
+     * Native calls [StatusListener.onStatus] on each status change (debounced ≥250 ms) and the remote-control
+     * callbacks as requests arrive, from a native thread.
+     */
     external fun setListener(listener: StatusListener?)
+
+    // [controlPc] actions; keep in sync with crates/android-native/src/controls.rs.
+    const val PC_AUDIO = 0
+    const val PC_MIC = 1
+    const val PC_MIC_DEFAULT = 2
+    const val PC_VOLUME = 3
+    const val PC_MUTE = 4
 }

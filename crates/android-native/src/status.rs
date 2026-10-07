@@ -2,7 +2,12 @@
 //!
 //! Schema (all keys always present):
 //! `{"state","micEnabled","micCapturing","micWanted","pcAudioActive","peers":[{"id","name","state","path","rttMs",
-//! "pcAudioEnabled","micEnabled","micDemanded","pcAudio":{...},"mic":{...},"error"}]}`
+//! "pcAudioEnabled","micEnabled","micDemanded","pcMic","micDefault","pcVolume","pcMuted","pcAudio":{...},"mic":{...},
+//! "error"}]}`
+//!
+//! Remote controls of each PC as it last reported them: `pcMic` is its own mic switch (`micEnabled` stays the
+//! effective state), `micDefault` = its virtual mic is the Windows default recording device, `pcVolume` = its default
+//! playback device volume in percent (`null` while unknown), `pcMuted` = that device is muted.
 
 use std::time::{Duration, Instant};
 
@@ -49,6 +54,13 @@ pub struct PeerView {
     pub pc_audio_enabled: bool,
     pub mic_enabled: bool,
     pub mic_demanded: bool,
+    /// The PC's own mic switch (`mic_enabled` is the effective state).
+    pub pc_mic: bool,
+    /// The virtual mic is the Windows default recording device on that PC.
+    pub mic_default: bool,
+    /// The PC's default playback device volume in percent; `None` while unknown.
+    pub pc_volume: Option<u8>,
+    pub pc_muted: bool,
     pub pc_audio: StreamView,
     pub mic: StreamView,
     pub error: Option<String>,
@@ -66,6 +78,10 @@ impl PeerView {
             pc_audio_enabled: s.pc_audio_enabled,
             mic_enabled: s.mic_enabled,
             mic_demanded: s.mic_demanded,
+            pc_mic: s.pc.mic,
+            mic_default: s.pc.mic_default,
+            pc_volume: s.pc.volume.map(|v| v.level),
+            pc_muted: s.pc.volume.is_some_and(|v| v.muted),
             pc_audio: StreamView::from_stats(&s.pc_audio),
             mic: StreamView::from_stats(&s.mic),
             error: s.last_error.clone(),
@@ -83,6 +99,10 @@ impl PeerView {
             pc_audio_enabled: false,
             mic_enabled: false,
             mic_demanded: false,
+            pc_mic: false,
+            mic_default: false,
+            pc_volume: None,
+            pc_muted: false,
             pc_audio: StreamView::IDLE,
             mic: StreamView::IDLE,
             error,
@@ -98,6 +118,10 @@ impl PeerView {
             && self.pc_audio_enabled == o.pc_audio_enabled
             && self.mic_enabled == o.mic_enabled
             && self.mic_demanded == o.mic_demanded
+            && self.pc_mic == o.pc_mic
+            && self.mic_default == o.mic_default
+            && self.pc_volume == o.pc_volume
+            && self.pc_muted == o.pc_muted
             && self.pc_audio.active == o.pc_audio.active
             && self.mic.active == o.mic.active
             && self.error == o.error
@@ -290,7 +314,7 @@ impl NotifyGate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use audiobridge_core::session::PeerStatus;
+    use audiobridge_core::session::{PcControls, PeerStatus, Volume};
 
     fn stats(active: bool, buffer_ms: f32, kbps: f32) -> StreamStats {
         StreamStats { active, buffer_ms, underruns: 3, lost_packets: 7, kbps }
@@ -307,6 +331,8 @@ mod tests {
             mic_demanded: false,
             pc_audio: stats(true, 31.04, 190.46),
             mic: stats(false, 0.0, 0.0),
+            pc: PcControls { audio: true, mic: true, mic_default: false, volume: Some(Volume { level: 64, muted: false }) },
+            phone: None,
             last_error: None,
         }
     }
@@ -346,6 +372,10 @@ mod tests {
                 "pcAudioEnabled": true,
                 "micEnabled": true,
                 "micDemanded": false,
+                "pcMic": true,
+                "micDefault": false,
+                "pcVolume": 64,
+                "pcMuted": false,
                 "pcAudio": {"active": true, "bufferMs": 31.0, "underruns": 3, "lost": 7, "kbps": 190.5},
                 "mic": {"active": false, "bufferMs": 0.0, "underruns": 3, "lost": 7, "kbps": 0.0},
                 "error": null
@@ -448,6 +478,41 @@ mod tests {
     }
 
     #[test]
+    fn pc_remote_controls_reach_json() {
+        use serde_json::json;
+
+        let mut reported = connected(Some("LYTEN"));
+        // The phone's switch is off: the effective `micEnabled` is off while the PC's own switch stays on.
+        reported.mic_enabled = false;
+        reported.pc =
+            PcControls { audio: true, mic: true, mic_default: true, volume: Some(Volume { level: 37, muted: true }) };
+        let mut unknown_volume = connected(None);
+        unknown_volume.pc = PcControls { mic: false, volume: None, ..PcControls::default() };
+        let status = hub(vec![("a", reported), ("b", unknown_volume)]);
+        // "c" is configured but the hub does not report it yet: shown as starting.
+        let configured = [("a", "DESKTOP"), ("b", "LAPTOP"), ("c", "NEW")];
+        let v: serde_json::Value =
+            serde_json::from_str(&StatusView::from_hub(&status, configured, false).to_json()).unwrap();
+
+        let keys = ["micEnabled", "pcMic", "micDefault", "pcVolume", "pcMuted"];
+        let controls: Vec<Vec<serde_json::Value>> = v["peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| keys.iter().map(|k| p.get(*k).cloned().unwrap_or_else(|| panic!("missing {k}"))).collect())
+            .collect();
+        assert_eq!(
+            controls,
+            [
+                vec![json!(false), json!(true), json!(true), json!(37), json!(true)],
+                // Unknown volume: null and never muted.
+                vec![json!(true), json!(false), json!(false), json!(null), json!(false)],
+                vec![json!(false), json!(false), json!(false), json!(null), json!(false)],
+            ]
+        );
+    }
+
+    #[test]
     fn classify_separates_stats_from_meaning() {
         let base = view(vec![("a", connected(Some("LYTEN"))), ("b", connected(None))]);
         assert_eq!(classify(&base, &base.clone()), Change::None);
@@ -472,6 +537,11 @@ mod tests {
             |v| v.peers[1].pc_audio_enabled = false,
             |v| v.peers[1].mic_enabled = false,
             |v| v.peers[1].mic_demanded = true,
+            |v| v.peers[1].pc_mic = false,
+            |v| v.peers[1].mic_default = true,
+            |v| v.peers[1].pc_volume = Some(10),
+            |v| v.peers[1].pc_volume = None,
+            |v| v.peers[1].pc_muted = true,
             |v| v.peers[1].pc_audio.active = false,
             |v| v.peers[1].mic.active = true,
             |v| v.peers[1].error = Some("x".into()),

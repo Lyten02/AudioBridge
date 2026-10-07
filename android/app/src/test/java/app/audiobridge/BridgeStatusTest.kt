@@ -17,10 +17,15 @@ class BridgeStatusTest {
         pcActive: Boolean = true,
         micEnabled: Boolean = true,
         micDemanded: Boolean = false,
+        pcMic: Boolean = true,
+        micDefault: Boolean = false,
+        pcVolume: String = "64",
+        pcMuted: Boolean = false,
         error: String = "null",
     ) = """
         {"id":"$id","name":"$name","state":"$state","path":$path,"rttMs":$rtt,"pcAudioEnabled":true,
-         "micEnabled":$micEnabled,"micDemanded":$micDemanded,
+         "micEnabled":$micEnabled,"micDemanded":$micDemanded,"pcMic":$pcMic,"micDefault":$micDefault,
+         "pcVolume":$pcVolume,"pcMuted":$pcMuted,
          "pcAudio":{"active":$pcActive,"bufferMs":31.0,"underruns":2,"lost":7,"kbps":190.5},
          "mic":{"active":false,"bufferMs":0,"underruns":0,"lost":0,"kbps":0},
          "error":$error}
@@ -50,6 +55,28 @@ class BridgeStatusTest {
         assertEquals(StreamStats(active = true, bufferMs = 31f, underruns = 2, lost = 7, kbps = 190.5f), p.pcAudio)
         assertFalse(p.mic.active)
         assertNull(p.error)
+        assertTrue(p.pcMic)
+        assertFalse(p.micDefault)
+        assertEquals(64, p.pcVolume)
+        assertFalse(p.pcMuted)
+    }
+
+    @Test
+    fun parsesPcRemoteControls() {
+        val p = BridgeStatus.parse(
+            hub(peers = listOf(peer(micEnabled = false, micDefault = true, pcVolume = "37", pcMuted = true))),
+        ).peers[0]
+        // The PC's own switch stays on while the effective state is off.
+        assertFalse(p.micEnabled)
+        assertTrue(p.pcMic)
+        assertTrue(p.micDefault)
+        assertEquals(37, p.pcVolume)
+        assertTrue(p.pcMuted)
+
+        val unknown = BridgeStatus.parse(hub(peers = listOf(peer(pcMic = false, pcVolume = "null")))).peers[0]
+        assertFalse(unknown.pcMic)
+        assertNull(unknown.pcVolume)
+        assertFalse(unknown.pcMuted)
     }
 
     @Test

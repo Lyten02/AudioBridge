@@ -6,14 +6,15 @@ use std::sync::mpsc::Sender;
 use std::sync::{Mutex, OnceLock};
 
 use audiobridge_core::pairing::PairingInfo;
-use audiobridge_core::session::{ConnState, Server, Status};
+use audiobridge_core::proto::MAX_LEVEL;
+use audiobridge_core::session::{ConnState, PcRequest, PhoneRequest, Server, Status, Volume};
 use tokio::sync::watch;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     IsIconic, PostMessageW, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
 };
 
-use crate::audio::{set_default_render, AudioMsg, Desired, DeviceSummary};
+use crate::audio::{set_default_endpoint, AudioMsg, Desired, DeviceSummary};
 use crate::cable_install::InstallState;
 use crate::settings::Settings;
 use crate::{autostart, tray};
@@ -111,14 +112,102 @@ impl Shared {
         self.repaint();
     }
 
-    pub fn set_pc_audio(&self, on: bool) {
+    /// "Звук ПК": streams PC audio; switching it on also undoes a VB-CABLE takeover of the
+    /// default playback device (loopback pauses while CABLE is the default).
+    pub fn set_pc_audio(&'static self, on: bool) {
         self.with_server(|s| s.set_pc_audio_enabled(on));
         self.update_settings(|s| s.pc_audio_enabled = on);
+        let d = self.devices();
+        if on && d.default_is_cable {
+            let remembered = self.settings().last_default_render;
+            match d.render_restore_candidate(remembered.as_deref()) {
+                Some(target) => self.restore_default_render(target.id.clone()),
+                None => tracing::warn!("default playback device is VB-CABLE and no other playback device is active"),
+            }
+        }
     }
 
-    pub fn set_mic(&self, on: bool) {
+    /// One-button "Микрофон": on = the PC accepts the phone mic, the phone mic is switched on
+    /// remotely and the virtual mic becomes the default recording device; off = the PC stops
+    /// accepting it and the previous recording device is restored. The phone mic itself stays
+    /// on (other PCs may use it; the phone stops capturing when no PC wants it).
+    pub fn set_mic(&'static self, on: bool) {
         self.with_server(|s| s.set_mic_enabled(on));
         self.update_settings(|s| s.mic_enabled = on);
+        if on {
+            let phone = self.status.borrow().phone;
+            if phone.is_some_and(|p| !p.mic) {
+                self.set_phone_mic(true);
+            }
+        }
+        self.set_mic_default(on);
+    }
+
+    /// Makes the virtual mic ("CABLE Output") the Windows default recording device, or restores
+    /// the previous recording device if it is the default.
+    pub fn set_mic_default(&'static self, on: bool) {
+        let d = self.devices();
+        if on {
+            match &d.cable_capture_id {
+                Some(_) if d.default_capture_is_cable => {}
+                Some(id) => self.switch_default_device(id.clone(), "recording"),
+                None => tracing::warn!("cannot make the virtual mic the default recording device: no VB-CABLE"),
+            }
+        } else if d.default_capture_is_cable {
+            let remembered = self.settings().last_default_capture;
+            match d.capture_restore_candidate(remembered.as_deref()) {
+                Some(target) => self.switch_default_device(target.id.clone(), "recording"),
+                None => tracing::warn!("the virtual mic is the default recording device and there is nothing to restore"),
+            }
+        }
+    }
+
+    /// Default playback device volume, percent.
+    pub fn set_volume(&self, level: u8) {
+        self.send_audio(AudioMsg::SetVolume(level.min(MAX_LEVEL)));
+    }
+
+    /// Mutes/unmutes the default playback device.
+    pub fn set_mute(&self, muted: bool) {
+        self.send_audio(AudioMsg::SetMute(muted));
+    }
+
+    /// Default playback device volume as read by the audio engine (reported to the phone).
+    pub fn set_pc_volume_state(&self, v: Option<Volume>) {
+        self.with_server(|s| s.set_volume(v));
+    }
+
+    /// Switches the connected phone's mic.
+    pub fn set_phone_mic(&self, on: bool) {
+        self.request_phone(PhoneRequest::Mic(on));
+    }
+
+    /// Sets the connected phone's media volume, percent.
+    pub fn set_phone_volume(&self, level: u8) {
+        self.request_phone(PhoneRequest::Volume(level.min(MAX_LEVEL)));
+    }
+
+    fn request_phone(&self, req: PhoneRequest) {
+        let mut sent = false;
+        self.with_server(|s| sent = s.request_phone(req));
+        if !sent {
+            tracing::info!("phone request {req:?} dropped: no phone connected");
+        }
+    }
+
+    /// Applies a remote-control request from the phone; results flow back through `Status`.
+    pub fn apply_request(&'static self, req: PcRequest) {
+        match req {
+            PcRequest::Volume(_) => tracing::debug!("phone request: {req:?}"),
+            _ => tracing::info!("phone request: {req:?}"),
+        }
+        match req {
+            PcRequest::Audio(on) => self.set_pc_audio(on),
+            PcRequest::Mic(on) => self.set_mic(on),
+            PcRequest::MicDefault(on) => self.set_mic_default(on),
+            PcRequest::Volume(level) => self.set_volume(level),
+            PcRequest::Mute(muted) => self.set_mute(muted),
+        }
     }
 
     pub fn set_autostart(&self, on: bool) {
@@ -139,13 +228,29 @@ impl Shared {
 
     pub fn set_devices(&self, d: &DeviceSummary) {
         *lock(&self.devices) = d.clone();
-        if !d.default_is_cable {
-            if let Some(id) = &d.default_render_id {
-                if lock(&self.settings).last_default_render.as_ref() != Some(id) {
-                    let id = id.clone();
-                    self.update_settings(|s| s.last_default_render = Some(id));
+        self.with_server(|s| s.set_mic_default(d.default_capture_is_cable));
+        // Remember the user's own devices so a VB-CABLE default can be undone later.
+        let render = d.default_render_id.as_ref().filter(|_| !d.default_is_cable);
+        let capture = d
+            .default_capture_id
+            .as_ref()
+            .filter(|id| d.capture_endpoints.iter().any(|c| c.id == **id && !c.is_cable));
+        let (render, capture) = {
+            let s = lock(&self.settings);
+            (
+                render.filter(|id| s.last_default_render.as_ref() != Some(*id)).cloned(),
+                capture.filter(|id| s.last_default_capture.as_ref() != Some(*id)).cloned(),
+            )
+        };
+        if render.is_some() || capture.is_some() {
+            self.update_settings(|s| {
+                if let Some(id) = render {
+                    s.last_default_render = Some(id);
                 }
-            }
+                if let Some(id) = capture {
+                    s.last_default_capture = Some(id);
+                }
+            });
         }
         self.repaint();
     }
@@ -154,19 +259,29 @@ impl Shared {
         *lock(&self.audio_tx) = Some(tx);
     }
 
+    fn send_audio(&self, msg: AudioMsg) {
+        if let Some(tx) = lock(&self.audio_tx).as_ref() {
+            let _ = tx.send(msg);
+        }
+    }
+
     /// Re-reads the device list (e.g. after the VB-CABLE installer exits).
     pub fn rescan_devices(&self) {
-        if let Some(tx) = lock(&self.audio_tx).as_ref() {
-            let _ = tx.send(AudioMsg::DevicesChanged);
-        }
+        self.send_audio(AudioMsg::DevicesChanged);
     }
 
     /// Makes `id` the default playback device again (undoes a VB-CABLE takeover).
     pub fn restore_default_render(&'static self, id: String) {
+        self.switch_default_device(id, "playback");
+    }
+
+    /// Makes `id` the default device of its direction (`what`: "playback"/"recording", for logs)
+    /// on a helper thread, since the COM calls can block, then re-reads the device list.
+    fn switch_default_device(&'static self, id: String, what: &'static str) {
         let spawned = std::thread::Builder::new().name("set-default-device".into()).spawn(move || {
-            match set_default_render(&id) {
-                Ok(()) => tracing::info!("default playback device restored to {id}"),
-                Err(e) => tracing::warn!("restoring the default playback device failed: {e:#}"),
+            match set_default_endpoint(&id) {
+                Ok(()) => tracing::info!("default {what} device set to {id}"),
+                Err(e) => tracing::warn!("setting the default {what} device failed: {e:#}"),
             }
             self.rescan_devices();
         });

@@ -122,6 +122,7 @@ fn run(primary: instance::Primary, background: bool, data_dir: &Path) -> Result<
     server.set_mic_enabled(settings.mic_enabled);
     let capture = server.pc_audio_capture();
     let playout = server.mic_playout();
+    let requests = server.take_requests();
 
     let (main_tx, main_rx) = mpsc::channel();
     let sh = shared::init(data_dir.to_path_buf(), pc_name, server, settings, main_tx);
@@ -132,11 +133,20 @@ fn run(primary: instance::Primary, background: bool, data_dir: &Path) -> Result<
         Hooks {
             on_devices: Box::new(|d| shared().set_devices(d)),
             on_demand: Box::new(|v| shared().set_mic_demand(v)),
+            on_volume: Box::new(|v| shared().set_pc_volume_state(v)),
         },
     )
     .context("audio thread")?;
     sh.set_audio_sender(audio.sender());
     sh.spawn_watchers(&rt, audio.sender());
+    // Remote control from the phone: the server only forwards requests; the app applies them.
+    if let Some(mut requests) = requests {
+        rt.spawn(async move {
+            while let Some(req) = requests.recv().await {
+                shared().apply_request(req);
+            }
+        });
+    }
     let tray = tray::spawn().context("tray icon")?;
     primary.listen_for_show(|| shared().show_window());
     primary.listen_for_quit(|| shared().request_exit());

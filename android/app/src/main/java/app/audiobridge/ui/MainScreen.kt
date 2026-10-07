@@ -41,8 +41,10 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.IconToggleButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
@@ -52,9 +54,11 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -70,12 +74,14 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import app.audiobridge.BridgeStatus
+import app.audiobridge.NativeBridge
 import app.audiobridge.PairedPc
 import app.audiobridge.PeerStatus
 import app.audiobridge.R
 import app.audiobridge.Reachability
 import app.audiobridge.pathLabel
 import kotlin.math.roundToInt
+import kotlinx.coroutines.delay
 
 /** One missing background-operation prerequisite. */
 data class SetupItem(
@@ -112,6 +118,8 @@ fun MainScreen(
     onAddPc: () -> Unit,
     onRemovePc: (String) -> Unit,
     onMicToggle: (Boolean) -> Unit,
+    /** Remote control of a connected PC: `NativeBridge.PC_*` action and its value. */
+    onPcControl: (pcId: String, action: Int, value: Int) -> Unit,
 ) {
     var removeId by rememberSaveable { mutableStateOf<String?>(null) }
     val rows = pcs.map { PcRow(it, status.peer(it.id)) }
@@ -140,7 +148,15 @@ fun MainScreen(
                 OverviewCard(rows, status)
                 MicCard(rows, status, mic, onMicToggle)
                 SectionHeader(stringResource(R.string.pcs_title), rows.size)
-                rows.forEach { row -> key(row.pc.id) { PcCard(row, onRemove = { removeId = row.pc.id }) } }
+                rows.forEach { row ->
+                    key(row.pc.id) {
+                        PcCard(
+                            row,
+                            onRemove = { removeId = row.pc.id },
+                            onControl = { action, value -> onPcControl(row.pc.id, action, value) },
+                        )
+                    }
+                }
                 AddPcButton(onAddPc)
                 AnimatedVisibility(visible = setupItems.isNotEmpty()) {
                     SetupCard(setupItems)
@@ -352,7 +368,7 @@ private fun SectionHeader(title: String, count: Int) {
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun PcCard(row: PcRow, onRemove: () -> Unit) {
+private fun PcCard(row: PcRow, onRemove: () -> Unit, onControl: (action: Int, value: Int) -> Unit) {
     val reach = row.reachability
     val color by animateColorAsState(reachabilityColor(reach), label = "pcColor")
     val peer = row.peer
@@ -423,6 +439,8 @@ private fun PcCard(row: PcRow, onRemove: () -> Unit) {
                     }
                     if (peer.micDemanded) MicBadge()
                 }
+                Spacer(Modifier.height(12.dp))
+                PcControls(peer, onControl, Modifier.padding(end = 12.dp))
             } else {
                 val error = peer?.error
                 if (reach == Reachability.Offline && !error.isNullOrBlank()) {
@@ -437,6 +455,112 @@ private fun PcCard(row: PcRow, onRemove: () -> Unit) {
                     )
                 }
             }
+        }
+    }
+}
+
+/** Remote controls of a connected PC: audio and mic switches, plus its volume once the PC reports it. */
+@Composable
+private fun PcControls(peer: PeerStatus, onControl: (action: Int, value: Int) -> Unit, modifier: Modifier = Modifier) {
+    Surface(
+        shape = RoundedCornerShape(20.dp),
+        color = MaterialTheme.colorScheme.surfaceContainerHighest,
+        modifier = modifier.fillMaxWidth(),
+    ) {
+        Column(Modifier.padding(vertical = 4.dp)) {
+            ControlSwitchRow(
+                title = stringResource(R.string.pc_control_audio),
+                subtitle = null,
+                checked = peer.pcAudioEnabled,
+                onToggle = { onControl(NativeBridge.PC_AUDIO, if (it) 1 else 0) },
+            )
+            ControlSwitchRow(
+                title = stringResource(R.string.pc_control_mic),
+                subtitle = stringResource(
+                    if (peer.micDefault) R.string.pc_control_mic_default else R.string.pc_control_mic_make_default,
+                ),
+                checked = peer.pcMic,
+                onToggle = { onControl(NativeBridge.PC_MIC, if (it) 1 else 0) },
+            )
+            val volume = peer.pcVolume
+            if (volume != null) {
+                PcVolumeRow(
+                    level = volume,
+                    muted = peer.pcMuted,
+                    onVolume = { onControl(NativeBridge.PC_VOLUME, it) },
+                    onMute = { onControl(NativeBridge.PC_MUTE, if (it) 1 else 0) },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ControlSwitchRow(title: String, subtitle: String?, checked: Boolean, onToggle: (Boolean) -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .toggleable(value = checked, role = Role.Switch, onValueChange = onToggle)
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(title, style = MaterialTheme.typography.bodyLarge)
+            if (subtitle != null) {
+                Text(
+                    subtitle,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        Spacer(Modifier.width(12.dp))
+        Switch(checked = checked, onCheckedChange = null)
+    }
+}
+
+/**
+ * The PC volume: mute toggle and a 0..100 slider. While dragging, and until the PC reports the new level (at most
+ * 1 s), the slider shows the local value; a request goes out only when the rounded value changes.
+ */
+@Composable
+private fun PcVolumeRow(level: Int, muted: Boolean, onVolume: (Int) -> Unit, onMute: (Boolean) -> Unit) {
+    var local by remember { mutableStateOf<Float?>(null) }
+    var dragging by remember { mutableStateOf(false) }
+    LaunchedEffect(local, dragging, level) {
+        val held = local ?: return@LaunchedEffect
+        if (dragging) return@LaunchedEffect
+        if (held.roundToInt() != level) delay(1000)
+        local = null
+    }
+    Column(Modifier.padding(top = 8.dp)) {
+        Text(
+            stringResource(R.string.pc_control_volume),
+            style = MaterialTheme.typography.bodyLarge,
+            modifier = Modifier.padding(horizontal = 16.dp),
+        )
+        Row(
+            modifier = Modifier.padding(start = 4.dp, end = 16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            IconToggleButton(checked = muted, onCheckedChange = onMute) {
+                Icon(
+                    painterResource(if (muted) R.drawable.ic_volume_off else R.drawable.ic_volume_up),
+                    contentDescription = stringResource(R.string.pc_control_mute),
+                )
+            }
+            Slider(
+                value = local ?: level.toFloat(),
+                onValueChange = { value ->
+                    val previous = (local ?: level.toFloat()).roundToInt()
+                    dragging = true
+                    local = value
+                    if (value.roundToInt() != previous) onVolume(value.roundToInt())
+                },
+                onValueChangeFinished = { dragging = false },
+                valueRange = 0f..100f,
+                modifier = Modifier.weight(1f),
+            )
         }
     }
 }

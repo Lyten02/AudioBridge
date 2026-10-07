@@ -5,12 +5,12 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use audiobridge_core::pairing::PairingInfo;
 use jni::objects::{JObject, JString};
-use jni::sys::{jboolean, jstring, JNI_FALSE};
+use jni::sys::{jboolean, jint, jstring, JNI_FALSE};
 use jni::JNIEnv;
 
 use super::engine::{self, Cmd};
 use super::logging;
-use crate::peers;
+use crate::{controls, peers};
 use crate::status::{PairingView, StatusView};
 
 fn guard<R>(name: &str, fallback: R, f: impl FnOnce() -> R) -> R {
@@ -163,15 +163,52 @@ pub extern "system" fn Java_app_audiobridge_NativeBridge_setPeers<'l>(
     })
 }
 
+/// `enabled`: the user's mic switch; `ready`: RECORD_AUDIO is granted and the service holds the microphone FGS
+/// type. Capture needs both; every PC sees both.
 #[no_mangle]
-pub extern "system" fn Java_app_audiobridge_NativeBridge_setMicAllowed<'l>(
+pub extern "system" fn Java_app_audiobridge_NativeBridge_setMicState<'l>(
     _env: JNIEnv<'l>,
     _this: JObject<'l>,
-    allowed: jboolean,
+    enabled: jboolean,
+    ready: jboolean,
 ) {
-    guard("setMicAllowed", (), || {
-        if let Some(engine) = engine_or_log("setMicAllowed") {
-            engine.send(Cmd::MicAllowed(allowed != JNI_FALSE));
+    guard("setMicState", (), || {
+        if let Some(engine) = engine_or_log("setMicState") {
+            engine.send(Cmd::MicState { enabled: enabled != JNI_FALSE, ready: ready != JNI_FALSE });
+        }
+    })
+}
+
+/// Phone media volume in percent reported to the PCs; negative = unknown, above 100 is clamped.
+#[no_mangle]
+pub extern "system" fn Java_app_audiobridge_NativeBridge_setVolume<'l>(
+    _env: JNIEnv<'l>,
+    _this: JObject<'l>,
+    percent: jint,
+) {
+    guard("setVolume", (), || {
+        if let Some(engine) = engine_or_log("setVolume") {
+            engine.send(Cmd::Volume(controls::volume_percent(percent)));
+        }
+    })
+}
+
+/// Remote control of the PC `peerId`: `action` is a `NativeBridge.PC_*` constant, `value` 0/1 for switches and
+/// `0..=100` for the volume (see [`controls::pc_request`]). Dropped (logged) if that PC is not connected.
+#[no_mangle]
+pub extern "system" fn Java_app_audiobridge_NativeBridge_controlPc<'l>(
+    mut env: JNIEnv<'l>,
+    _this: JObject<'l>,
+    peer_id: JString<'l>,
+    action: jint,
+    value: jint,
+) {
+    guard("controlPc", (), || {
+        let Some(engine) = engine_or_log("controlPc") else { return };
+        let Some(peer_id) = read_string(&mut env, &peer_id) else { return };
+        match controls::pc_request(action, value) {
+            Some(req) => engine.send(Cmd::ControlPc { peer_id, req }),
+            None => log::warn!("controlPc: unknown action {action}"),
         }
     })
 }

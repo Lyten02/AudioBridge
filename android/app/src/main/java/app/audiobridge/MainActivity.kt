@@ -99,6 +99,7 @@ class MainActivity : ComponentActivity() {
                     onAddPc = ::scan,
                     onRemovePc = ::removePc,
                     onMicToggle = ::setMic,
+                    onPcControl = ::controlPc,
                 )
             }
         }
@@ -187,6 +188,15 @@ class MainActivity : ComponentActivity() {
         }
         prefs.setMicEnabled(on)
         startBridge()
+    }
+
+    // endregion
+
+    // region remote control
+
+    /** [action] is a `NativeBridge.PC_*` constant; native drops the request (logged) if that PC is not connected. */
+    private fun controlPc(pcId: String, action: Int, value: Int) {
+        NativeBridge.controlPc(pcId, action, value)
     }
 
     // endregion

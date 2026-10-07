@@ -1,5 +1,6 @@
 //! Audio engine: a supervisor thread that opens/closes WASAPI streams from session status
-//! and device notifications. It blocks with no timeout while no phone is connected.
+//! and device notifications, and follows the default playback device's volume. It blocks with
+//! no timeout while no phone is connected; every event arrives as a channel message.
 
 pub(crate) mod com;
 mod demand;
@@ -8,6 +9,7 @@ mod format;
 mod loopback;
 mod policy;
 mod render;
+mod volume;
 
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
@@ -16,16 +18,18 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use audiobridge_core::audio::{CaptureHandle, PlayoutHandle};
+use audiobridge_core::session::Volume;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::PROPERTYKEY;
 use windows::Win32::Media::Audio::{
-    eConsole, eRender, EDataFlow, ERole, IMMNotificationClient, IMMNotificationClient_Impl, DEVICE_STATE,
+    eCapture, eConsole, eRender, EDataFlow, ERole, IMMNotificationClient, IMMNotificationClient_Impl, DEVICE_STATE,
 };
 
 use self::com::{Com, Event};
 use self::demand::DemandProbe;
 pub use self::devices::DeviceSummary;
-pub use self::policy::set_default_render;
+pub use self::policy::set_default_endpoint;
+use self::volume::VolumeControl;
 
 /// What the session wants from the audio side, derived from `Status`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -38,12 +42,20 @@ pub struct Desired {
 pub enum AudioMsg {
     Desired(Desired),
     DevicesChanged,
+    /// The default playback device's volume or mute changed (from any source).
+    VolumeChanged,
+    /// Set the default playback device's volume, percent.
+    SetVolume(u8),
+    /// Mute/unmute the default playback device.
+    SetMute(bool),
     Shutdown,
 }
 
 pub struct Hooks {
     pub on_devices: Box<dyn Fn(&DeviceSummary) + Send>,
     pub on_demand: Box<dyn Fn(bool) + Send>,
+    /// Default playback device volume, called on change only (`None` without a default device).
+    pub on_volume: Box<dyn Fn(Option<Volume>) + Send>,
 }
 
 const TICK: Duration = Duration::from_secs(1);
@@ -93,7 +105,8 @@ impl IMMNotificationClient_Impl for Notifier_Impl {
         Ok(())
     }
     fn OnDefaultDeviceChanged(&self, flow: EDataFlow, role: ERole, _id: &PCWSTR) -> windows::core::Result<()> {
-        if flow == eRender && role == eConsole {
+        // Playback: loopback source and volume; recording: whether the virtual mic is the default.
+        if (flow == eRender || flow == eCapture) && role == eConsole {
             let _ = self.tx.send(AudioMsg::DevicesChanged);
         }
         Ok(())
@@ -218,6 +231,7 @@ fn supervise(
             return;
         }
     };
+    let volume_tx = notifier_tx.clone();
     let notifier: IMMNotificationClient = Notifier { tx: notifier_tx }.into();
     // SAFETY: COM call on a valid enumerator; unregistered below before drop.
     if let Err(e) = unsafe { enumerator.RegisterEndpointNotificationCallback(&notifier) } {
@@ -227,6 +241,9 @@ fn supervise(
     let mut devices = devices::summarize(&enumerator);
     (hooks.on_devices)(&devices);
     tracing::info!("audio devices: {devices:?}");
+    let mut volume = VolumeControl::new(volume_tx);
+    volume.follow(&enumerator, devices.default_render_id.as_ref());
+    report_volume(&mut volume, &hooks);
 
     let mut desired = Desired::default();
     let mut probe = DemandProbe::default();
@@ -242,6 +259,9 @@ fn supervise(
             rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
         };
         let mut devices_dirty = false;
+        let mut volume_dirty = false;
+        let mut set_level = None;
+        let mut set_mute = None;
         let mut msgs = match first {
             Ok(m) => vec![m],
             Err(RecvTimeoutError::Timeout) => Vec::new(),
@@ -252,6 +272,10 @@ fn supervise(
             match m {
                 AudioMsg::Desired(d) => desired = d,
                 AudioMsg::DevicesChanged => devices_dirty = true,
+                AudioMsg::VolumeChanged => volume_dirty = true,
+                // Only the latest request matters (a dragged slider sends many).
+                AudioMsg::SetVolume(level) => set_level = Some(level),
+                AudioMsg::SetMute(m) => set_mute = Some(m),
                 AudioMsg::Shutdown => break 'outer,
             }
         }
@@ -263,6 +287,19 @@ fn supervise(
                 (hooks.on_devices)(&devices);
                 probe.reset();
             }
+            volume.follow(&enumerator, devices.default_render_id.as_ref());
+            volume_dirty = true;
+        }
+        if let Some(level) = set_level {
+            volume.set_level(level);
+            volume_dirty = true;
+        }
+        if let Some(m) = set_mute {
+            volume.set_mute(m);
+            volume_dirty = true;
+        }
+        if volume_dirty {
+            report_volume(&mut volume, &hooks);
         }
         let want_pc = desired.connected
             && desired.pc_audio
@@ -286,8 +323,18 @@ fn supervise(
     }
     pc.stop();
     mic.stop();
+    // Unregisters the volume callback while COM is still initialised.
+    drop(volume);
     // SAFETY: matches the registration above.
     unsafe {
         let _ = enumerator.UnregisterEndpointNotificationCallback(&notifier);
+    }
+}
+
+/// Hands the default playback device volume to the hook if it changed since the last report.
+fn report_volume(volume: &mut VolumeControl, hooks: &Hooks) {
+    if let Some(v) = volume.take_change() {
+        tracing::debug!("playback volume: {v:?}");
+        (hooks.on_volume)(v);
     }
 }

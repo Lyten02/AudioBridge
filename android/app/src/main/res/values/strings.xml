@@ -56,6 +56,14 @@
     <string name="remove_body">Телефон перестанет подключаться к этому компьютеру. Чтобы вернуть его, снова отсканируйте QR-код.</string>
     <string name="cancel">Отмена</string>
 
+    <!-- PC remote control -->
+    <string name="pc_control_audio">Звук компьютера</string>
+    <string name="pc_control_mic">Микрофон на компьютере</string>
+    <string name="pc_control_mic_default">Основной микрофон Windows</string>
+    <string name="pc_control_mic_make_default">Включение сделает его основным микрофоном Windows</string>
+    <string name="pc_control_volume">Громкость компьютера</string>
+    <string name="pc_control_mute">Без звука</string>
+
     <!-- Mic -->
     <string name="mic_title">Микрофон телефона</string>
     <string name="mic_in_use">Микрофон сейчас используется на ПК</string>

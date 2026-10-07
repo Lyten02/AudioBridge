@@ -80,7 +80,7 @@ class Prefs private constructor(private val sp: SharedPreferences) {
 object StatusHub {
     val status = MutableStateFlow(BridgeStatus.IDLE)
 
-    /** The service currently runs with the microphone FGS type (so native capture is allowed). */
+    /** The service holds the microphone FGS type and RECORD_AUDIO is granted (mic ready); capture also needs the switch. */
     val micForeground = MutableStateFlow(false)
 }
 

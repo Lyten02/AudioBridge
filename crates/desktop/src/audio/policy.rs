@@ -1,5 +1,5 @@
-//! Setting the default playback device. Windows has no public API for this; every tool
-//! (including the Sound control panel) uses the undocumented but long-stable `IPolicyConfig`
+//! Setting the default playback/recording device. Windows has no public API for this; every
+//! tool (including the Sound control panel) uses the undocumented but long-stable `IPolicyConfig`
 //! (CLSID_PolicyConfigClient, Windows 7+ layout).
 // Vtable methods keep their COM names.
 #![allow(non_snake_case)]
@@ -31,8 +31,9 @@ unsafe trait IPolicyConfig: windows_core::IUnknown {
     fn SetEndpointVisibility(&self, id: PCWSTR, visible: i32) -> HRESULT;
 }
 
-/// Makes `endpoint_id` the default playback device for all roles (console, multimedia, communications).
-pub fn set_default_render(endpoint_id: &str) -> Result<()> {
+/// Makes `endpoint_id` the default device of its direction (playback or recording) for all roles
+/// (console, multimedia, communications).
+pub fn set_default_endpoint(endpoint_id: &str) -> Result<()> {
     let _com = Com::init();
     let id = HSTRING::from(endpoint_id);
     // SAFETY: COM is initialised on this thread; `id` outlives the calls.
