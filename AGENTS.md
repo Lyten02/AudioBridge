@@ -19,7 +19,9 @@ PC (Server)  WASAPI render "CABLE Input" ◄─ PlayoutHandle (jitter buffer, de
   - **Real-time rule:** `push`, `fill`, `Playout::fill` and `Mixer::fill` must never allocate, lock or block. Mixer slots are preallocated; peers attach, detach and are muted via atomics; the sender is woken with `Thread::unpark`.
 - **Roles:** `session::Server` is the PC side; it serves one active phone and a new connection replaces the old one (close codes 1 = replaced, 2 = rejected, 3 = shutdown). `session::Hub` is the phone side: one iroh endpoint, one task per PC, `MAX_PEERS = 8`, `SLOTS = 16`.
 - **Dialing:** the phone always dials the PC, which works through NAT and double NAT.
-- **Control:** a single bi-stream carrying `ControlMsg` frames (`len u16 | tag | body`): Hello{secret} → Welcome/Reject, Toggles, MicDemand, MicAllowed.
+- **Control (protocol v2):** a single bi-stream carrying `ControlMsg` frames (`len u16 | tag | body`): Hello{secret, PhoneControls} → Welcome{PcControls}/Reject, PcState, MicDemand, PhoneState, SetPc, SetPhone. Each side reads the stream through `spawn_control_reader` (a task feeding a channel), so `select!` never cancels a half-read frame. A Hello of another version still decodes far enough to be rejected with a readable reason.
+- **Remote control:** each side owns its controls and reports them (`PcControls`: audio, mic, mic_default = CABLE Output is the Windows default recording device, default playback volume; `PhoneControls`: mic switch, mic_ready, media volume). The other side may ask for a change (`PcRequest` / `PhoneRequest`). Core never applies requests: `Server::take_requests` / `Hub::take_requests` hand them to the app, which applies them and reports the result through the setters (`Server::set_mic_default`, `set_volume`, …; `Hub::set_phone_controls`). `Status.pc` / `Status.phone` carry the reported state.
+- **One-switch actions (PC):** "Микрофон" on = accept the mic + ask the phone to switch its mic on + make CABLE Output the default recording device; off = restore the remembered recording device (the phone mic is left alone: other PCs may use it). "Звук ПК" on also undoes a CABLE takeover of the default playback device.
 - **Datagram header:** 8 bytes, `0xAB | kind | stream | 0 | seq u32 LE`. Kinds: Audio, Silence (after 300 ms of digital silence the sender emits markers and stops), Pace (an empty keep-awake packet that the Hub sends every 20 ms while a PC's audio streams and that PC isn't receiving our mic; with the screen off, Android ≥14 won't let apps disable Wi-Fi power save, and uplink traffic is what keeps the radio awake. Receivers ignore it).
 - **Playout (NetEQ-lite, `audio/playout.rs`):**
   - Underrun policy: a missing frame with newer packets present → PLC, advance; buffer empty → "expand" PLC without advancing (no skipped content); after 70 ms of PLC fade to silence; resume with a 2.5 ms fade-in; never re-buffer the full target.
@@ -32,7 +34,7 @@ PC (Server)  WASAPI render "CABLE Input" ◄─ PlayoutHandle (jitter buffer, de
   - Loopback runs only when `connected && pc_audio_enabled` and the default device is not a VB-CABLE device.
   - Mic render runs only while `mic.active`.
   - Mic demand comes from `audio/demand.rs`: another process holding an active capture session on "CABLE Output".
-- **Android audio policy** (`policy.rs`): output opens on `pcAudioActive` and closes after 30 s idle. Mic capture runs iff `micWanted && micAllowed`.
+- **Android audio policy** (`policy.rs`): output opens on `pcAudioActive` and closes after 30 s idle. Mic capture runs iff `micWanted && phone.mic_allowed()` (user switch && mic_ready).
 
 ## Key Directories
 - `crates/core/src/`
@@ -82,12 +84,12 @@ cargo ndk -t arm64-v8a clippy -p audiobridge-android --all-targets -- -D warning
   - Desktop: daily files in `%LOCALAPPDATA%\AudioBridge\logs`; filter via the `AUDIOBRIDGE_LOG` env var.
   - Android: `tracing` → `log` → logcat tag `AudioBridge`. The filter in `logging.rs` must keep `tracing::span=off`, otherwise span enter/exit lines flood logcat several times per audio frame.
 - **Contract coupling:** these pieces change together.
-  - The statusJson v2 schema (`android-native/src/status.rs`) ↔ `BridgeStatus.kt` (which throws on unknown states).
-  - Rust JNI symbols ↔ `NativeBridge.kt` ↔ `proguard-rules.pro` keep rules.
-  - Core `Server` API ↔ `crates/desktop`.
+  - The statusJson v2 schema (`android-native/src/status.rs`, incl. the per-PC remote controls `pcMic`, `micDefault`, `pcVolume`, `pcMuted`) ↔ `BridgeStatus.kt` (which throws on unknown states).
+  - Rust JNI symbols ↔ `NativeBridge.kt` ↔ `StatusListener.kt` (native calls `onStatus`, `onRemoteMic`, `onRemoteVolume` by name) ↔ `proguard-rules.pro` keep rules.
+  - Core `Server` API ↔ `crates/desktop`; core `ControlMsg` ↔ `PROTOCOL_VERSION` (both apps must be updated together).
 - **Persisted state:**
   - PC: `%APPDATA%\AudioBridge` holds `server.key`, `pairing.secret`, `server.port`, `settings.json` and `pairing.txt`. Writes go through tmp+rename; corrupt files are regenerated. Changing `server.key` or `pairing.secret` breaks every existing pairing.
-  - Phone: `<filesDir>/audiobridge/client.key`, plus SharedPreferences `audiobridge` (`paired_pcs` JSON list of `{id, name, uri, muted}`, `mic_enabled`, `autostart_done`).
+  - Phone: `<filesDir>/audiobridge/client.key`, plus SharedPreferences `audiobridge` (`paired_pcs` JSON list of `{id, name, uri, muted}`, `mic_enabled` (also flipped remotely by a PC), `autostart_done`).
 - **Default UDP port:** 47130, falling back to a random port.
 - **Screenshots and releases:** the pairing QR contains the PC's secret. Never publish it; promo shots replace it with a QR of the repo URL. GitHub Releases ship `AudioBridge.exe` (the release build) and `AudioBridge.apk` (the debug-signed APK from this machine's `~/.android/debug.keystore`; a different key can't update an installed app).
 
@@ -115,7 +117,7 @@ cargo ndk -t arm64-v8a clippy -p audiobridge-android --all-targets -- -D warning
 - **Android build:** AGP 8.10.1, Kotlin 2.2.0, Gradle 8.11.1 wrapper, JDK 17 target. Compose versions are pinned explicitly (no BOM). `FAIL_ON_PROJECT_REPOS` means repositories are declared only in `settings.gradle.kts`.
 - **Android 14/15 FGS rules:**
   - Boot and background starts may use only `connectedDevice`.
-  - The `microphone` type is added only from a visible activity or the notification action (a while-in-use exemption). `setMicAllowed(true)` is sent only while that type is held.
+  - The `microphone` type is added only from a visible activity or the notification action (a while-in-use exemption). It is then kept whenever RECORD_AUDIO is granted, independent of the user's mic switch, so a PC can switch the mic on remotely in the background. `setMicState(enabled, ready)` reports the switch and whether the type is held; capture needs both. After a reboot the phone reports `mic_ready = false` until the app or the notification action is opened once, and the PC UI says so.
   - HyperOS "Clear all" force-stops unlocked apps, so users must enable Autostart and lock the app in recents.
 - **Windows:**
   - Desktop `windows` crate features are listed explicitly; new Win32 APIs need the matching feature added.
@@ -127,7 +129,7 @@ cargo ndk -t arm64-v8a clippy -p audiobridge-android --all-targets -- -D warning
   - Core unit tests: proto, pairing, codec, tx gate, rx, the mixer limiter and persisted identity.
   - Playout simulations on a simulated clock (`audio/sim.rs`): jitter, power-save bursts, 2 % loss and ±0.15 % skew. They assert no exact-zero output runs and no skipped content.
   - `tests/rt_alloc.rs`: counts allocations and requires zero inside `push` and `fill`.
-  - `crates/core/tests/integration.rs`: a real Server + Hub in-process over `NetOptions::local_only()`, covering both directions plus latency < 60 ms, mixing from two PCs with mic routing, muting PCs on the phone, removing a PC, a wrong secret, reconnect, and uplink pacing. These tests are real-time and timing-sensitive; don't run them under heavy parallel load to judge flakiness.
+  - `crates/core/tests/integration.rs`: a real Server + Hub in-process over `NetOptions::local_only()`, covering both directions plus latency < 60 ms, mixing from two PCs with mic routing, muting PCs on the phone, removing a PC, a wrong secret, reconnect, uplink pacing and remote control in both directions. These tests are real-time and timing-sensitive; don't run them under heavy parallel load to judge flakiness.
   - **On-device glitch check:** the phone logs `pc audio glitch: … underruns=… lost=…` and the PC logs `mic glitch: …` whenever counters grow. Compare screen-on vs screen-off with music playing.
   - android-native: host tests for the statusJson v2 schema, `NotifyGate` debounce, policies and peer parsing.
   - Android: JVM tests `BridgeStatusTest` and `PairedPcTest` (`isReturnDefaultValues = false`); there is no instrumented test.

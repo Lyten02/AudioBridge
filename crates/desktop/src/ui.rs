@@ -347,6 +347,8 @@ fn switch_row(ui: &mut Ui, title: &str, subtitle: Option<&str>, on: bool) -> boo
     let mut clicked = false;
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
+            // leave room for the switch, so long subtitles wrap instead of pushing it out
+            ui.set_max_width((ui.available_width() - 56.0).max(0.0));
             ui.spacing_mut().item_spacing.y = 2.0;
             ui.label(RichText::new(title).size(14.5).color(TEXT));
             if let Some(sub) = subtitle {
@@ -383,6 +385,7 @@ fn wide_button(ui: &mut Ui, text: &str, icon: Option<fn(&Painter, Rect, Color32)
 struct UiApp {
     qr: Option<(String, TextureHandle)>,
     show_qr: bool,
+    volume_edit: VolumeEdit,
 }
 
 impl eframe::App for UiApp {
@@ -414,7 +417,7 @@ impl eframe::App for UiApp {
                 if !connected || self.show_qr {
                     self.qr_card(ui, pairing.as_deref(), connected, &status);
                 } else {
-                    connected_cards(ui, &status, &settings, &devices);
+                    connected_cards(ui, &status, &settings, &devices, &mut self.volume_edit);
                     if wide_button(ui, "Показать QR-код", Some(icon_qr)) {
                         self.show_qr = true;
                     }
@@ -479,15 +482,28 @@ fn tile(ui: &mut Ui, rect: Rect, t: &TileSpec) -> bool {
     p.text(pos2(inner.left(), inner.top() + 62.0), Align2::LEFT_CENTER, t.title, semibold(15.5), TEXT);
     p.text(pos2(inner.left(), inner.top() + 82.0), Align2::LEFT_CENTER, t.route, FontId::proportional(12.5), MUTED);
     let sy = inner.bottom() - 6.0;
-    p.circle_filled(pos2(inner.left() + 4.0, sy), 3.5, t.state_color);
-    p.text(pos2(inner.left() + 14.0, sy), Align2::LEFT_CENTER, t.state, FontId::proportional(12.5), t.state_color);
+    // A long state wraps (it may use half of the right padding); it grows upwards, and the dot
+    // marks its first row.
+    let wrap = inner.width() - 14.0 + PAD / 2.0;
+    let galley = p.layout(t.state.to_owned(), FontId::proportional(12.5), t.state_color, wrap);
+    let rows = galley.rows.len().max(1);
+    let row_h = galley.size().y / rows as f32;
+    let top = sy + row_h / 2.0 - galley.size().y + if rows > 1 { 6.0 } else { 0.0 };
+    p.circle_filled(pos2(inner.left() + 4.0, top + row_h / 2.0), 3.5, t.state_color);
+    p.galley(pos2(inner.left() + 14.0, top), galley, t.state_color);
 
     let sw = Rect::from_min_size(pos2(inner.right() - 44.0, inner.top() + 7.0), vec2(44.0, 26.0));
     // a child UI that does not move the parent's cursor (the row was allocated by the caller)
     toggle(&mut ui.new_child(UiBuilder::new().max_rect(sw)), t.on)
 }
 
-fn connected_cards(ui: &mut Ui, status: &Status, settings: &Settings, devices: &DeviceSummary) {
+fn connected_cards(
+    ui: &mut Ui,
+    status: &Status,
+    settings: &Settings,
+    devices: &DeviceSummary,
+    edit: &mut VolumeEdit,
+) {
     let sh = shared();
 
     // the phone
@@ -524,10 +540,15 @@ fn connected_cards(ui: &mut Ui, status: &Status, settings: &Settings, devices: &
     } else {
         ("Тишина", MUTED)
     };
+    let phone = status.phone;
     let (mic_state, mic_color) = if devices.cable_render_id.is_none() {
         ("Нужен VB-CABLE", AMBER)
     } else if !settings.mic_enabled {
         ("Выключено", MUTED)
+    } else if phone.is_some_and(|p| !p.mic) {
+        ("Выключен на телефоне", AMBER)
+    } else if phone.is_some_and(|p| !p.mic_ready) {
+        ("Откройте приложение на телефоне", AMBER)
     } else if status.mic.active {
         ("Передаётся", GREEN)
     } else if status.mic_demanded {
@@ -565,6 +586,8 @@ fn connected_cards(ui: &mut Ui, status: &Status, settings: &Settings, devices: &
         sh.set_mic(!settings.mic_enabled);
     }
 
+    controls_card(ui, status, devices, edit);
+
     // numbers
     card(ui, CARD, CARD_STROKE, |ui| {
         // the playout buffer lives on the receiving side; here: link, outgoing rate and codec
@@ -584,6 +607,125 @@ fn connected_cards(ui: &mut Ui, status: &Status, settings: &Settings, devices: &
             }
         });
     });
+}
+
+/// Local slider values while a volume slider is held: reports lag behind the drag.
+#[derive(Default)]
+struct VolumeEdit {
+    pc: Option<f32>,
+    phone: Option<f32>,
+}
+
+/// Detailed remote controls next to the one-button tiles.
+fn controls_card(ui: &mut Ui, status: &Status, devices: &DeviceSummary, edit: &mut VolumeEdit) {
+    let sh = shared();
+    card(ui, CARD, CARD_STROKE, |ui| {
+        ui.label(RichText::new("Управление").font(semibold(15.5)).color(TEXT));
+
+        let pc_volume = status.pc.volume;
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 4.0;
+            ui.label(RichText::new("Громкость компьютера").size(14.5).color(TEXT));
+            ui.horizontal(|ui| {
+                let muted = pc_volume.is_some_and(|v| v.muted);
+                if mute_button(ui, pc_volume.is_some(), muted) {
+                    sh.set_mute(!muted);
+                }
+                if let Some(level) = level_slider(ui, pc_volume.map(|v| v.level), &mut edit.pc) {
+                    sh.set_volume(level);
+                }
+            });
+        });
+
+        match status.phone {
+            Some(phone) => {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 4.0;
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Громкость телефона").size(14.5).color(TEXT));
+                        if phone.volume.is_none() {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.label(RichText::new("нет данных").size(12.5).color(MUTED));
+                            });
+                        }
+                    });
+                    if phone.volume.is_some() {
+                        ui.horizontal(|ui| {
+                            if let Some(level) = level_slider(ui, phone.volume, &mut edit.phone) {
+                                sh.set_phone_volume(level);
+                            }
+                        });
+                    }
+                });
+                let sub = if phone.mic_ready {
+                    "Переключатель микрофона на телефоне"
+                } else {
+                    "Откройте AudioBridge на телефоне один раз: без этого Android не даёт записывать в фоне"
+                };
+                if switch_row(ui, "Микрофон телефона", Some(sub), phone.mic) {
+                    sh.set_phone_mic(!phone.mic);
+                }
+            }
+            None => edit.phone = None,
+        }
+
+        let on = devices.default_capture_is_cable;
+        let has_cable = devices.cable_capture_id.is_some();
+        let sub = if has_cable { "CABLE Output — основной микрофон Windows" } else { "Нужен VB-CABLE" };
+        if switch_row(ui, "Микрофон по умолчанию", Some(sub), on) && has_cable {
+            sh.set_mic_default(!on);
+        }
+    });
+}
+
+/// Speaker button of the PC volume row: MUTED with a slash while muted. Returns true when clicked.
+fn mute_button(ui: &mut Ui, enabled: bool, muted: bool) -> bool {
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, resp) = ui.allocate_exact_size(vec2(32.0, 32.0), sense);
+    let p = ui.painter();
+    if enabled && resp.hovered() {
+        p.rect_filled(rect, CornerRadius::same(8), CARD_HOVER);
+    }
+    let color = if !enabled {
+        MUTED.gamma_multiply(0.5)
+    } else if muted {
+        MUTED
+    } else {
+        TEXT
+    };
+    let icon = rect.shrink(5.0);
+    icon_speaker(p, icon, color);
+    if muted {
+        let inset = icon.width() * 0.12;
+        let slash = [icon.left_top() + vec2(inset, inset), icon.right_bottom() - vec2(inset, inset)];
+        p.line_segment(slash, Stroke::new(icon.width() * 0.08, color));
+    }
+    enabled && resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+}
+
+/// A 0..=100 slider filling the rest of the row, then a right-aligned "NN %". Disabled while
+/// `level` is unknown. `edit` keeps the local value while the slider is held, so lagging
+/// reports don't make the handle jump. Returns the new level when its rounded value changed.
+fn level_slider(ui: &mut Ui, level: Option<u8>, edit: &mut Option<f32>) -> Option<u8> {
+    const VALUE_W: f32 = 44.0;
+    let enabled = level.is_some();
+    let mut value = edit.unwrap_or_else(|| f32::from(level.unwrap_or(0)));
+    let before = value.round() as u8;
+    ui.spacing_mut().slider_width = (ui.available_width() - VALUE_W - ui.spacing().item_spacing.x).max(40.0);
+    let v = ui.visuals_mut();
+    v.selection.bg_fill = TEAL;
+    v.widgets.inactive.bg_fill = TOGGLE_OFF;
+    v.widgets.inactive.fg_stroke = Stroke::new(2.0, Color32::WHITE);
+    v.widgets.hovered.bg_fill = Color32::WHITE;
+    v.widgets.active.bg_fill = Color32::WHITE;
+    let slider = egui::Slider::new(&mut value, 0.0..=100.0).show_value(false).trailing_fill(true);
+    let resp = ui.add_enabled(enabled, slider);
+    *edit = (resp.dragged() || resp.is_pointer_button_down_on()).then_some(value);
+    let now = value.round() as u8;
+    let (rect, _) = ui.allocate_exact_size(vec2(VALUE_W, 20.0), Sense::hover());
+    let (text, color) = if enabled { (format!("{now} %"), TEXT) } else { ("—".to_owned(), MUTED) };
+    ui.painter().text(rect.right_center(), Align2::RIGHT_CENTER, text, FontId::proportional(13.5), color);
+    (enabled && resp.changed() && now != before).then_some(now)
 }
 
 impl UiApp {
@@ -688,7 +830,7 @@ fn warnings(ui: &mut Ui, devices: &DeviceSummary, settings: &Settings) {
                 .size(13.0)
                 .color(TEXT),
             );
-            match devices.restore_candidate(settings.last_default_render.as_deref()) {
+            match devices.render_restore_candidate(settings.last_default_render.as_deref()) {
                 Some(target) => {
                     if ui.button(RichText::new(format!("Вернуть «{}»", target.name)).size(13.5)).clicked() {
                         sh.restore_default_render(target.id.clone());

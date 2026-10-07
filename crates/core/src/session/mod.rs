@@ -9,14 +9,15 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use iroh::endpoint::Connection;
+use iroh::endpoint::{Connection, RecvStream};
 use iroh::TransportAddr;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 use crate::audio::tx::TxStats;
 use crate::audio::RxSlot;
-use crate::proto::{DatagramHeader, PacketKind, StreamId};
+use crate::proto::{ControlMsg, DatagramHeader, PacketKind, StreamId};
 
+pub use crate::proto::{PcControls, PcRequest, PhoneControls, PhoneRequest, Volume};
 pub use hub::{Hub, MAX_PEERS};
 pub use server::Server;
 
@@ -65,6 +66,11 @@ pub struct Status {
     pub mic_demanded: bool,
     pub pc_audio: StreamStats,
     pub mic: StreamStats,
+    /// PC side: its own controls. Phone side: the controls this PC last reported.
+    pub pc: PcControls,
+    /// PC side: the connected phone's last reported controls (`None` without a phone).
+    /// Always `None` on the phone side.
+    pub phone: Option<PhoneControls>,
     pub last_error: Option<String>,
 }
 
@@ -80,6 +86,8 @@ impl Status {
             mic_demanded: false,
             pc_audio: StreamStats::default(),
             mic: StreamStats::default(),
+            pc: PcControls::default(),
+            phone: None,
             last_error: None,
         }
     }
@@ -401,6 +409,33 @@ fn clear_connection_status(s: &mut Status) {
         st.kbps = 0.0;
         st.buffer_ms = 0.0;
     }
+}
+
+/// Capacity of the decoded control-message queue of one connection.
+const CONTROL_QUEUE: usize = 32;
+
+/// Reads framed control messages into a channel until the stream ends or fails (the channel
+/// then closes). Control loops poll the channel instead of `read_from` directly, so a
+/// `select!` branch firing mid-frame never drops half a message. The task ends by itself
+/// when the connection is closed.
+fn spawn_control_reader(mut recv: RecvStream) -> mpsc::Receiver<ControlMsg> {
+    let (tx, rx) = mpsc::channel(CONTROL_QUEUE);
+    tokio::spawn(async move {
+        loop {
+            match ControlMsg::read_from(&mut recv).await {
+                Ok(msg) => {
+                    if tx.send(msg).await.is_err() {
+                        return;
+                    }
+                }
+                Err(err) => {
+                    tracing::debug!("control stream ended: {err:#}");
+                    return;
+                }
+            }
+        }
+    });
+    rx
 }
 
 /// Constant-time equality for the pairing secret.

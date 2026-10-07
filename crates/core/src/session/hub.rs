@@ -9,20 +9,21 @@ use anyhow::{bail, Context, Result};
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
 use iroh::Endpoint;
 use parking_lot::Mutex;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use tokio::task::JoinHandle;
 
 use super::{
-    clear_connection_status, net, recv_media, stats_loop, ConnState, Dir, HubConfig, HubStatus,
-    Media, NetOptions, PeerStatus, Status, StatusCell,
+    clear_connection_status, net, recv_media, spawn_control_reader, stats_loop, ConnState, Dir, HubConfig,
+    HubStatus, Media, NetOptions, PeerStatus, Status, StatusCell,
 };
 use crate::audio::tx::TxStats;
 use crate::audio::{CaptureHandle, IncomingStream, OutgoingStream, PlayoutHandle, RxSlot};
 use crate::pairing::PairingInfo;
 use crate::proto::{
-    ControlMsg, DatagramHeader, PacketKind, StreamId, ALPN, DATAGRAM_HEADER_LEN, PROTOCOL_VERSION,
+    ControlMsg, DatagramHeader, PacketKind, PcControls, PcRequest, PhoneControls, PhoneRequest, StreamId, ALPN,
+    DATAGRAM_HEADER_LEN, PROTOCOL_VERSION,
 };
 
 /// Maximum number of simultaneously paired PCs.
@@ -49,7 +50,10 @@ struct Shared {
     endpoint: Endpoint,
     device_name: String,
     status: Arc<watch::Sender<HubStatus>>,
-    mic_allowed: watch::Sender<bool>,
+    /// Phone-side controls, reported to every PC.
+    phone: watch::Sender<PhoneControls>,
+    /// Requests from PCs, for the app to apply.
+    requests: mpsc::UnboundedSender<PhoneRequest>,
     /// Incremented by `network_changed()`; every peer task watches it.
     net_changed: watch::Sender<u64>,
     pc_audio: IncomingStream,
@@ -61,11 +65,10 @@ struct Shared {
     runtime: tokio::runtime::Handle,
 }
 
-/// PC-side toggles as last reported by the PC.
+/// PC-side state as last reported by the PC.
 #[derive(Clone, Copy, Debug)]
 struct Remote {
-    pc_audio: bool,
-    mic: bool,
+    pc: PcControls,
     mic_demand: bool,
 }
 
@@ -76,6 +79,8 @@ struct Peer {
     info: Mutex<PairingInfo>,
     status: StatusCell,
     remote: Mutex<Option<Remote>>,
+    /// Requests for this PC while connected (written by the session's control loop).
+    to_pc: Mutex<Option<mpsc::UnboundedSender<PcRequest>>>,
     mic_stats: Arc<TxStats>,
     /// Notified when this PC's audio stream becomes active (starts uplink pacing).
     audio_started: tokio::sync::Notify,
@@ -96,6 +101,7 @@ struct PeerEntry {
 pub struct Hub {
     shared: Arc<Shared>,
     peers: Mutex<Vec<PeerEntry>>,
+    requests: Mutex<Option<mpsc::UnboundedReceiver<PhoneRequest>>>,
 }
 
 impl Hub {
@@ -106,15 +112,18 @@ impl Hub {
     pub async fn start_with_options(cfg: HubConfig, opts: NetOptions) -> Result<Hub> {
         let key = net::client_identity(&cfg.data_dir)?;
         let endpoint = net::bind_client(key, &opts).await?;
+        let phone = PhoneControls { mic: true, mic_ready: true, volume: None };
         let status = HubStatus {
-            mic_enabled: true,
+            mic_enabled: phone.mic_allowed(),
             ..HubStatus::default()
         };
+        let (requests_tx, requests) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
             endpoint,
             device_name: cfg.device_name,
             status: Arc::new(watch::channel(status).0),
-            mic_allowed: watch::channel(true).0,
+            phone: watch::channel(phone).0,
+            requests: requests_tx,
             net_changed: watch::channel(0).0,
             pc_audio: IncomingStream::new_mixed(StreamId::PcAudio, SLOTS)?,
             mic: OutgoingStream::new(StreamId::Mic, MIC_BITRATE, MIC_COMPLEXITY)?,
@@ -127,6 +136,7 @@ impl Hub {
         Ok(Hub {
             shared,
             peers: Mutex::new(Vec::new()),
+            requests: Mutex::new(Some(requests)),
         })
     }
 
@@ -186,6 +196,7 @@ impl Hub {
                 },
                 info: Mutex::new(info),
                 remote: Mutex::new(None),
+                to_pc: Mutex::new(None),
                 mic_stats: Arc::new(TxStats::default()),
                 audio_started: tokio::sync::Notify::new(),
                 pace_sent: std::sync::atomic::AtomicU64::new(0),
@@ -276,19 +287,37 @@ impl Hub {
         self.shared.status.subscribe()
     }
 
-    /// Phone-side mic permission/toggle (applies to all PCs).
-    pub fn set_mic_enabled(&self, on: bool) {
-        self.shared.mic_allowed.send_if_modified(|v| std::mem::replace(v, on) != on);
+    /// Phone-side controls (apply to all PCs): the mic is sent only if
+    /// [`PhoneControls::mic_allowed`]; every PC is told the new values.
+    pub fn set_phone_controls(&self, phone: PhoneControls) {
+        self.shared.phone.send_if_modified(|v| std::mem::replace(v, phone) != phone);
+        let allowed = phone.mic_allowed();
         self.shared.status.send_if_modified(|h| {
-            if h.mic_enabled == on {
+            if h.mic_enabled == allowed {
                 return false;
             }
-            h.mic_enabled = on;
+            h.mic_enabled = allowed;
             true
         });
         for e in self.peers.lock().iter() {
             e.peer.refresh_toggles();
         }
+    }
+
+    /// Sends a remote-control request to the PC `peer_id`; `false` if it is not connected.
+    pub fn request_pc(&self, peer_id: &str, req: PcRequest) -> bool {
+        let peers = self.peers.lock();
+        let Some(e) = peers.iter().find(|e| e.id == peer_id) else {
+            return false;
+        };
+        let sent = e.peer.to_pc.lock().as_ref().is_some_and(|tx| tx.send(req).is_ok());
+        sent
+    }
+
+    /// Remote-control requests from PCs. The hub does not apply them; the app does (and
+    /// reports the result through [`Hub::set_phone_controls`]). `None` after the first call.
+    pub fn take_requests(&self) -> Option<mpsc::UnboundedReceiver<PhoneRequest>> {
+        self.requests.lock().take()
     }
 
     /// Call on connectivity changes: every PC retries immediately and iroh re-probes paths.
@@ -348,11 +377,11 @@ impl Peer {
     }
 
     fn refresh_toggles(&self) {
-        let allowed = *self.hub.mic_allowed.borrow();
+        let allowed = self.hub.phone.borrow().mic_allowed();
         let remote = *self.remote.lock();
-        let (pc_audio, mic, demand, connected) = match remote {
-            Some(r) => (r.pc_audio, allowed && r.mic, r.mic_demand, true),
-            None => (true, allowed, false, false),
+        let (pc, mic, demand, connected) = match remote {
+            Some(r) => (r.pc, allowed && r.pc.mic, r.mic_demand, true),
+            None => (PcControls::default(), allowed, false, false),
         };
         self.hub
             .mic
@@ -360,9 +389,10 @@ impl Peer {
             .shared
             .set_enabled(self.slot, connected && mic && demand);
         self.status.update(|s| {
-            s.pc_audio_enabled = pc_audio;
+            s.pc_audio_enabled = pc.audio;
             s.mic_enabled = mic;
             s.mic_demanded = demand;
+            s.pc = pc;
         });
     }
 
@@ -402,9 +432,10 @@ impl Peer {
                     backoff = BACKOFF_MIN;
                     retry_now = true;
                 }
-                Some(Ok((conn, send, recv, pc_name))) => {
+                Some(Ok(session)) => {
                     let started = Instant::now();
-                    let reason = self.run_session(&conn, send, recv, pc_name).await;
+                    let conn = session.conn.clone();
+                    let reason = self.run_session(session).await;
                     if self.cancel.is_cancelled() {
                         conn.close(VarInt::from_u32(0), b"shutdown");
                         return;
@@ -432,7 +463,7 @@ impl Peer {
     }
 
     /// Dials the PC and performs the Hello/Welcome handshake.
-    async fn connect_once(&self) -> Result<(Connection, SendStream, RecvStream, String)> {
+    async fn connect_once(&self) -> Result<Session> {
         let info = self.info.lock().clone();
         let conn = tokio::time::timeout(
             CONNECT_TIMEOUT,
@@ -443,35 +474,33 @@ impl Peer {
         .context("connect")?;
         let handshake = async {
             let (mut send, mut recv) = conn.open_bi().await?;
-            let mic_allowed = *self.hub.mic_allowed.borrow();
+            let phone = *self.hub.phone.borrow();
             ControlMsg::Hello {
                 version: PROTOCOL_VERSION,
                 secret: *info.secret(),
                 device_name: self.hub.device_name.clone(),
-                mic_allowed,
+                phone,
             }
             .write_to(&mut send)
             .await?;
             match ControlMsg::read_from(&mut recv).await? {
                 ControlMsg::Welcome {
                     pc_name,
-                    pc_audio_enabled,
-                    mic_enabled,
+                    pc,
                     mic_demanded,
                 } => {
                     *self.remote.lock() = Some(Remote {
-                        pc_audio: pc_audio_enabled,
-                        mic: mic_enabled,
+                        pc,
                         mic_demand: mic_demanded,
                     });
-                    Ok((send, recv, pc_name))
+                    Ok((send, recv, pc_name, phone))
                 }
                 ControlMsg::Reject { reason } => bail!("rejected by PC: {reason}"),
                 other => bail!("unexpected handshake reply {other:?}"),
             }
         };
         match tokio::time::timeout(HELLO_TIMEOUT, handshake).await {
-            Ok(Ok((send, recv, pc_name))) => Ok((conn, send, recv, pc_name)),
+            Ok(Ok((send, recv, pc_name, sent))) => Ok(Session { conn, send, recv, pc_name, sent }),
             Ok(Err(err)) => {
                 conn.close(VarInt::from_u32(0), b"handshake failed");
                 Err(err)
@@ -484,7 +513,9 @@ impl Peer {
     }
 
     /// Runs one connected session; returns the reason it ended.
-    async fn run_session(&self, conn: &Connection, send: SendStream, recv: RecvStream, pc_name: String) -> String {
+    async fn run_session(&self, session: Session) -> String {
+        let Session { conn, send, recv, pc_name, sent } = session;
+        let conn = &conn;
         tracing::info!("connected to '{pc_name}'");
         self.rx().feeder.lock().reset();
         self.hub
@@ -492,6 +523,8 @@ impl Peer {
             .tx
             .shared
             .set_target(self.slot, Some(conn.clone()), &self.mic_stats);
+        let (to_pc, to_pc_rx) = mpsc::unbounded_channel();
+        *self.to_pc.lock() = Some(to_pc);
         self.status.update(|s| {
             clear_connection_status(s);
             s.state = ConnState::Connected;
@@ -510,7 +543,7 @@ impl Peer {
         let reason = tokio::select! {
             _ = self.cancel.cancelled() => "removed".to_owned(),
             e = conn.closed() => format!("connection closed: {e}"),
-            r = self.control_loop(send, recv) => match r {
+            r = self.control_loop(send, recv, sent, to_pc_rx) => match r {
                 Ok(()) => "control stream closed".to_owned(),
                 Err(err) => format!("control stream: {err:#}"),
             },
@@ -518,6 +551,7 @@ impl Peer {
             _ = stats_loop(conn, &media, &self.status) => "stats ended".to_owned(),
             _ = self.pace_loop(conn) => "pacing ended".to_owned(),
         };
+        *self.to_pc.lock() = None;
         self.hub.mic.tx.shared.set_target(self.slot, None, &self.mic_stats);
         *self.remote.lock() = None;
         conn.close(VarInt::from_u32(0), b"bye");
@@ -564,40 +598,63 @@ impl Peer {
         }
     }
 
-    async fn control_loop(&self, mut send: SendStream, mut recv: RecvStream) -> Result<()> {
-        let mut allowed_rx = self.hub.mic_allowed.subscribe();
-        let mut sent = *allowed_rx.borrow_and_update();
-        // the value may have changed between Hello and now
-        ControlMsg::MicAllowed(sent).write_to(&mut send).await?;
+    async fn control_loop(
+        &self,
+        mut send: SendStream,
+        recv: RecvStream,
+        mut sent: PhoneControls,
+        mut to_pc: mpsc::UnboundedReceiver<PcRequest>,
+    ) -> Result<()> {
+        let mut incoming = spawn_control_reader(recv);
+        let mut phone_rx = self.hub.phone.subscribe();
+        // the controls may have changed between Hello and now
+        phone_rx.mark_changed();
         loop {
             tokio::select! {
-                msg = ControlMsg::read_from(&mut recv) => {
-                    let msg = msg?;
-                    {
-                        let mut remote = self.remote.lock();
-                        let r = remote.as_mut().context("not connected")?;
-                        match msg {
-                            ControlMsg::Toggles { pc_audio_enabled, mic_enabled } => {
-                                r.pc_audio = pc_audio_enabled;
-                                r.mic = mic_enabled;
+                msg = incoming.recv() => {
+                    let Some(msg) = msg else { return Ok(()) };
+                    match msg {
+                        ControlMsg::SetPhone(req) => {
+                            tracing::info!("PC request: {req:?}");
+                            let _ = self.hub.requests.send(req);
+                            continue;
+                        }
+                        msg => {
+                            let mut remote = self.remote.lock();
+                            let r = remote.as_mut().context("not connected")?;
+                            match msg {
+                                ControlMsg::PcState(pc) => r.pc = pc,
+                                ControlMsg::MicDemand(on) => r.mic_demand = on,
+                                other => tracing::debug!("unexpected control message {other:?}"),
                             }
-                            ControlMsg::MicDemand(on) => r.mic_demand = on,
-                            other => tracing::debug!("unexpected control message {other:?}"),
                         }
                     }
                     self.refresh_toggles();
                 }
-                r = allowed_rx.changed() => {
+                Some(req) = to_pc.recv() => {
+                    ControlMsg::SetPc(req).write_to(&mut send).await?;
+                }
+                r = phone_rx.changed() => {
                     r?;
-                    let now = *allowed_rx.borrow_and_update();
+                    let now = *phone_rx.borrow_and_update();
                     if now != sent {
-                        ControlMsg::MicAllowed(now).write_to(&mut send).await?;
+                        ControlMsg::PhoneState(now).write_to(&mut send).await?;
                         sent = now;
                     }
                 }
             }
         }
     }
+}
+
+/// A handshaken connection to a PC.
+struct Session {
+    conn: Connection,
+    send: SendStream,
+    recv: RecvStream,
+    pc_name: String,
+    /// Phone controls carried by the `Hello`.
+    sent: PhoneControls,
 }
 
 #[cfg(test)]

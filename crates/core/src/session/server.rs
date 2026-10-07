@@ -1,6 +1,6 @@
 //! PC side: accepts one active phone, streams PC audio, receives the phone mic.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,18 +8,20 @@ use anyhow::{bail, Result};
 use parking_lot::Mutex;
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
 use iroh::{Endpoint, Watcher};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    clear_connection_status, net, recv_media, secret_eq, stats_loop, ConnState, Dir, Media,
-    NetOptions, ServerConfig, Status, StatusCell,
+    clear_connection_status, net, recv_media, secret_eq, spawn_control_reader, stats_loop, ConnState, Dir,
+    Media, NetOptions, ServerConfig, Status, StatusCell,
 };
 use crate::audio::tx::TxStats;
 use crate::audio::{CaptureHandle, IncomingStream, OutgoingStream, PlayoutHandle};
 use crate::pairing::PairingInfo;
-use crate::proto::{ControlMsg, StreamId, PROTOCOL_VERSION};
+use crate::proto::{
+    ControlMsg, PcControls, PcRequest, PhoneControls, PhoneRequest, StreamId, Volume, PROTOCOL_VERSION,
+};
 
 const PC_AUDIO_BITRATE: i32 = 192_000;
 const PC_AUDIO_COMPLEXITY: i32 = 9;
@@ -33,8 +35,7 @@ const PHONE: usize = 0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Toggles {
-    pc_audio: bool,
-    mic: bool,
+    pc: PcControls,
     mic_demand: bool,
 }
 
@@ -42,6 +43,8 @@ struct ActiveConn {
     id: u64,
     conn: Connection,
     cancel: CancellationToken,
+    /// Requests for this phone, written by its control loop.
+    to_phone: mpsc::UnboundedSender<PhoneRequest>,
 }
 
 pub(super) struct Inner {
@@ -51,8 +54,10 @@ pub(super) struct Inner {
     status_tx: Arc<watch::Sender<Status>>,
     status: StatusCell,
     toggles: watch::Sender<Toggles>,
-    /// Phone-side mic permission of the connected phone.
-    phone_mic_allowed: AtomicBool,
+    /// Controls of the connected phone (`None` without a phone).
+    phone: Mutex<Option<PhoneControls>>,
+    /// Requests from the phone, for the app to apply.
+    requests: mpsc::UnboundedSender<PcRequest>,
     pc_audio: OutgoingStream,
     pc_audio_stats: Arc<TxStats>,
     pub(super) mic: IncomingStream,
@@ -65,6 +70,7 @@ pub(super) struct Inner {
 pub struct Server {
     pub(super) inner: Arc<Inner>,
     pairing: watch::Receiver<Option<PairingInfo>>,
+    requests: Mutex<Option<mpsc::UnboundedReceiver<PcRequest>>>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -79,10 +85,10 @@ impl Server {
         let status_tx = Arc::new(watch::channel(Status::new()).0);
         let status = StatusCell::Single(status_tx.clone());
         let toggles = Toggles {
-            pc_audio: true,
-            mic: true,
+            pc: PcControls::default(),
             mic_demand: false,
         };
+        let (requests_tx, requests) = mpsc::unbounded_channel();
         let inner = Arc::new(Inner {
             endpoint,
             secret,
@@ -90,7 +96,8 @@ impl Server {
             status_tx,
             status,
             toggles: watch::channel(toggles).0,
-            phone_mic_allowed: AtomicBool::new(true),
+            phone: Mutex::new(None),
+            requests: requests_tx,
             pc_audio: OutgoingStream::new(StreamId::PcAudio, PC_AUDIO_BITRATE, PC_AUDIO_COMPLEXITY)?,
             pc_audio_stats: Arc::new(TxStats::default()),
             mic: IncomingStream::new(StreamId::Mic)?,
@@ -114,6 +121,7 @@ impl Server {
         Ok(Server {
             inner,
             pairing,
+            requests: Mutex::new(Some(requests)),
             tasks,
         })
     }
@@ -128,21 +136,40 @@ impl Server {
     }
 
     pub fn set_pc_audio_enabled(&self, on: bool) {
-        self.inner.toggles.send_if_modified(|t| std::mem::replace(&mut t.pc_audio, on) != on);
-        self.inner.refresh_status_toggles();
+        self.inner.set_toggles(|t| t.pc.audio = on);
     }
 
     pub fn set_mic_enabled(&self, on: bool) {
-        self.inner.toggles.send_if_modified(|t| std::mem::replace(&mut t.mic, on) != on);
-        self.inner.refresh_status_toggles();
+        self.inner.set_toggles(|t| t.pc.mic = on);
     }
 
     /// Whether a PC application is capturing the virtual microphone.
     pub fn set_mic_demand(&self, demanded: bool) {
-        self.inner
-            .toggles
-            .send_if_modified(|t| std::mem::replace(&mut t.mic_demand, demanded) != demanded);
-        self.inner.refresh_status_toggles();
+        self.inner.set_toggles(|t| t.mic_demand = demanded);
+    }
+
+    /// Whether the virtual mic is the default recording device (reported to the phone).
+    pub fn set_mic_default(&self, on: bool) {
+        self.inner.set_toggles(|t| t.pc.mic_default = on);
+    }
+
+    /// Default playback device volume (reported to the phone); `None` while unknown.
+    pub fn set_volume(&self, volume: Option<Volume>) {
+        self.inner.set_toggles(|t| t.pc.volume = volume);
+    }
+
+    /// Remote-control requests from the phone. The server does not apply them; the app does
+    /// (and reports the result through the setters above). Returns `None` after the first call.
+    pub fn take_requests(&self) -> Option<mpsc::UnboundedReceiver<PcRequest>> {
+        self.requests.lock().take()
+    }
+
+    /// Sends a remote-control request to the connected phone; `false` without a phone.
+    pub fn request_phone(&self, req: PhoneRequest) -> bool {
+        match self.inner.active.lock().as_ref() {
+            Some(a) => a.to_phone.send(req).is_ok(),
+            None => false,
+        }
     }
 
     /// Stereo PC-audio capture handle (can be taken again after the previous one is dropped).
@@ -223,15 +250,27 @@ impl Inner {
         }
     }
 
+    fn set_toggles(&self, f: impl FnOnce(&mut Toggles)) {
+        self.toggles.send_if_modified(|t| {
+            let before = *t;
+            f(t);
+            *t != before
+        });
+        self.refresh_status_toggles();
+    }
+
     fn refresh_status_toggles(&self) {
         let t = *self.toggles.borrow();
         let connected = self.active.lock().is_some();
-        let phone_ok = !connected || self.phone_mic_allowed.load(Ordering::Acquire);
-        self.pc_audio.tx.shared.set_enabled(PHONE, connected && t.pc_audio);
+        let phone = if connected { *self.phone.lock() } else { None };
+        let phone_ok = phone.is_none_or(|p| p.mic_allowed());
+        self.pc_audio.tx.shared.set_enabled(PHONE, connected && t.pc.audio);
         self.status.update(|s| {
-            s.pc_audio_enabled = t.pc_audio;
-            s.mic_enabled = t.mic && phone_ok;
+            s.pc_audio_enabled = t.pc.audio;
+            s.mic_enabled = t.pc.mic && phone_ok;
             s.mic_demanded = t.mic_demand;
+            s.pc = t.pc;
+            s.phone = phone;
         });
     }
 
@@ -260,9 +299,7 @@ impl Inner {
                     }
                 };
                 match tokio::time::timeout(HANDSHAKE_TIMEOUT, this.authenticate(&conn)).await {
-                    Ok(Ok(Some((name, mic_allowed, send, recv)))) => {
-                        this.install(conn, name, mic_allowed, send, recv)
-                    }
+                    Ok(Ok(Some(hs))) => this.install(conn, hs),
                     Ok(Ok(None)) => {}
                     Ok(Err(err)) => tracing::info!("phone handshake failed: {err:#}"),
                     Err(_) => tracing::info!("phone handshake timed out"),
@@ -272,22 +309,21 @@ impl Inner {
     }
 
     /// Reads `Hello`; answers `Welcome` or `Reject`. `None` means rejected.
-    async fn authenticate(
-        &self,
-        conn: &Connection,
-    ) -> Result<Option<(String, bool, SendStream, RecvStream)>> {
+    async fn authenticate(&self, conn: &Connection) -> Result<Option<Handshake>> {
         let (mut send, mut recv) = conn.accept_bi().await?;
         let ControlMsg::Hello {
             version,
             secret,
             device_name,
-            mic_allowed,
+            phone,
         } = ControlMsg::read_from(&mut recv).await?
         else {
             bail!("expected Hello");
         };
         let reason = if version != PROTOCOL_VERSION {
-            Some(format!("unsupported protocol version {version}"))
+            Some(format!(
+                "unsupported protocol version {version} (PC: {PROTOCOL_VERSION}); update AudioBridge on both devices"
+            ))
         } else if !secret_eq(&secret, &self.secret) {
             Some("invalid pairing secret".to_owned())
         } else {
@@ -302,26 +338,26 @@ impl Inner {
             conn.close(VarInt::from_u32(CLOSE_REJECTED), b"rejected");
             return Ok(None);
         }
-        let t = *self.toggles.borrow();
+        let sent = *self.toggles.borrow();
         ControlMsg::Welcome {
             pc_name: self.pc_name.clone(),
-            pc_audio_enabled: t.pc_audio,
-            mic_enabled: t.mic,
-            mic_demanded: t.mic_demand,
+            pc: sent.pc,
+            mic_demanded: sent.mic_demand,
         }
         .write_to(&mut send)
         .await?;
-        Ok(Some((device_name, mic_allowed, send, recv)))
+        Ok(Some(Handshake { name: device_name, phone, sent, send, recv }))
     }
 
     /// Makes `conn` the active phone connection, replacing any previous one.
-    fn install(self: &Arc<Self>, conn: Connection, name: String, mic_allowed: bool, send: SendStream, recv: RecvStream) {
+    fn install(self: &Arc<Self>, conn: Connection, hs: Handshake) {
         if self.cancel.is_cancelled() {
             conn.close(VarInt::from_u32(CLOSE_SHUTDOWN), b"shutdown");
             return;
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let cancel = self.cancel.child_token();
+        let (to_phone, to_phone_rx) = mpsc::unbounded_channel();
         {
             let mut active = self.active.lock();
             if let Some(old) = active.take() {
@@ -333,10 +369,11 @@ impl Inner {
                 id,
                 conn: conn.clone(),
                 cancel: cancel.clone(),
+                to_phone,
             });
+            *self.phone.lock() = Some(hs.phone);
         }
-        tracing::info!("phone '{name}' connected ({})", conn.remote_id());
-        self.phone_mic_allowed.store(mic_allowed, Ordering::Release);
+        tracing::info!("phone '{}' connected ({}): {:?}", hs.name, conn.remote_id(), hs.phone);
         self.mic.slot(0).feeder.lock().reset();
         self.pc_audio
             .tx
@@ -345,17 +382,19 @@ impl Inner {
         self.status.update(|s| {
             clear_connection_status(s);
             s.state = ConnState::Connected;
-            s.peer_name = Some(name);
+            s.peer_name = Some(hs.name);
             s.last_error = None;
         });
         self.refresh_status_toggles();
         let this = self.clone();
+        let session = Session { id, sent: hs.sent, send: hs.send, recv: hs.recv, to_phone: to_phone_rx };
         tokio::spawn(async move {
-            this.run_connection(&conn, send, recv, &cancel).await;
+            this.run_connection(&conn, session, &cancel).await;
             let still_active = {
                 let mut active = this.active.lock();
                 if active.as_ref().is_some_and(|a| a.id == id) {
                     *active = None;
+                    *this.phone.lock() = None;
                     true
                 } else {
                     false
@@ -377,7 +416,7 @@ impl Inner {
         });
     }
 
-    async fn run_connection(&self, conn: &Connection, send: SendStream, recv: RecvStream, cancel: &CancellationToken) {
+    async fn run_connection(&self, conn: &Connection, session: Session, cancel: &CancellationToken) {
         let media = Media {
             tx: &self.pc_audio_stats,
             out_dir: Dir::PcAudio,
@@ -389,7 +428,7 @@ impl Inner {
         tokio::select! {
             _ = cancel.cancelled() => {}
             _ = conn.closed() => {}
-            r = self.control_loop(send, recv) => {
+            r = self.control_loop(session) => {
                 if let Err(err) = r {
                     tracing::debug!("control stream ended: {err:#}");
                 }
@@ -399,25 +438,40 @@ impl Inner {
         }
     }
 
-    async fn control_loop(&self, mut send: SendStream, mut recv: RecvStream) -> Result<()> {
+    async fn control_loop(&self, session: Session) -> Result<()> {
+        let Session { id, mut sent, mut send, recv, mut to_phone } = session;
+        let mut incoming = spawn_control_reader(recv);
         let mut toggles_rx = self.toggles.subscribe();
-        let mut sent = *toggles_rx.borrow_and_update();
+        // the toggles may have changed between Welcome and now
+        toggles_rx.mark_changed();
         loop {
             tokio::select! {
-                msg = ControlMsg::read_from(&mut recv) => match msg? {
-                    ControlMsg::MicAllowed(on) => {
-                        self.phone_mic_allowed.store(on, Ordering::Release);
+                msg = incoming.recv() => match msg {
+                    None => return Ok(()),
+                    Some(ControlMsg::PhoneState(phone)) => {
+                        {
+                            let active = self.active.lock();
+                            if active.as_ref().is_some_and(|a| a.id == id) {
+                                *self.phone.lock() = Some(phone);
+                            }
+                        }
+                        tracing::debug!("phone controls: {phone:?}");
                         self.refresh_status_toggles();
                     }
-                    other => tracing::debug!("unexpected control message {other:?}"),
+                    Some(ControlMsg::SetPc(req)) => {
+                        tracing::info!("phone request: {req:?}");
+                        let _ = self.requests.send(req);
+                    }
+                    Some(other) => tracing::debug!("unexpected control message {other:?}"),
                 },
+                Some(req) = to_phone.recv() => {
+                    ControlMsg::SetPhone(req).write_to(&mut send).await?;
+                }
                 r = toggles_rx.changed() => {
                     r?;
                     let t = *toggles_rx.borrow_and_update();
-                    if (t.pc_audio, t.mic) != (sent.pc_audio, sent.mic) {
-                        ControlMsg::Toggles { pc_audio_enabled: t.pc_audio, mic_enabled: t.mic }
-                            .write_to(&mut send)
-                            .await?;
+                    if t.pc != sent.pc {
+                        ControlMsg::PcState(t.pc).write_to(&mut send).await?;
                     }
                     if t.mic_demand != sent.mic_demand {
                         ControlMsg::MicDemand(t.mic_demand).write_to(&mut send).await?;
@@ -427,4 +481,23 @@ impl Inner {
             }
         }
     }
+}
+
+/// Result of an accepted `Hello`.
+struct Handshake {
+    name: String,
+    phone: PhoneControls,
+    /// Toggles carried by the `Welcome`.
+    sent: Toggles,
+    send: SendStream,
+    recv: RecvStream,
+}
+
+/// What the control loop of one connection owns.
+struct Session {
+    id: u64,
+    sent: Toggles,
+    send: SendStream,
+    recv: RecvStream,
+    to_phone: mpsc::UnboundedReceiver<PhoneRequest>,
 }

@@ -48,6 +48,13 @@ data class PeerStatus(
     val pcAudioEnabled: Boolean = true,
     val micEnabled: Boolean = false,
     val micDemanded: Boolean = false,
+    /** The PC's own mic switch ([micEnabled] is the effective state). */
+    val pcMic: Boolean = false,
+    /** The virtual mic is the Windows default recording device on that PC. */
+    val micDefault: Boolean = false,
+    /** The PC's default playback device volume in percent (0..100); null while unknown. */
+    val pcVolume: Int? = null,
+    val pcMuted: Boolean = false,
     val pcAudio: StreamStats = StreamStats(),
     val mic: StreamStats = StreamStats(),
     val error: String? = null,
@@ -113,6 +120,10 @@ data class BridgeStatus(
                 pcAudioEnabled = o.getBoolean("pcAudioEnabled"),
                 micEnabled = o.getBoolean("micEnabled"),
                 micDemanded = o.getBoolean("micDemanded"),
+                pcMic = o.getBoolean("pcMic"),
+                micDefault = o.getBoolean("micDefault"),
+                pcVolume = if (o.isNull("pcVolume")) null else o.getInt("pcVolume"),
+                pcMuted = o.getBoolean("pcMuted"),
                 pcAudio = parseStream(o.getJSONObject("pcAudio")),
                 mic = parseStream(o.getJSONObject("mic")),
                 error = o.optStringOrNull("error"),

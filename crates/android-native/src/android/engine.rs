@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use audiobridge_core::pairing::PairingInfo;
-use audiobridge_core::session::{Hub, HubConfig, HubStatus};
+use audiobridge_core::session::{Hub, HubConfig, HubStatus, PcRequest, PhoneControls, PhoneRequest};
 use jni::objects::GlobalRef;
 use jni::JavaVM;
 use tokio::runtime::Runtime;
@@ -24,9 +24,15 @@ use crate::status::StatusView;
 pub enum Cmd {
     /// The full set of paired PCs (already deduplicated by peer id); empty = disconnect all.
     SetPeers(Vec<PairingInfo>),
+    /// The phone mic: `enabled` = the user's switch, `ready` = Kotlin may record now (RECORD_AUDIO + microphone
+    /// FGS type). Capture needs both.
+    MicState { enabled: bool, ready: bool },
+    /// Phone media volume in percent; `None` while unknown.
+    Volume(Option<u8>),
+    /// Remote control of one paired PC.
+    ControlPc { peer_id: String, req: PcRequest },
     /// Peer ids whose audio is muted on the phone (the full set; empty = none).
     SetMuted(Vec<String>),
-    MicAllowed(bool),
     NetworkChanged,
 }
 
@@ -87,7 +93,8 @@ pub fn init(vm: JavaVM, files_dir: &str, device_name: &str) -> Result<(), String
         retry_at: None,
         backoff: Backoff::default(),
         start_error: None,
-        mic_allowed: false,
+        phone: PhoneControls::default(),
+        requests: None,
         audio_demand: None,
         glitches: std::collections::HashMap::new(),
     };
@@ -138,7 +145,10 @@ struct Manager {
     retry_at: Option<Instant>,
     backoff: Backoff,
     start_error: Option<String>,
-    mic_allowed: bool,
+    /// Phone-side controls as reported by Kotlin; every PC is told about changes.
+    phone: PhoneControls,
+    /// Remote-control requests from PCs, taken from the running hub; forwarded to Kotlin, which applies them.
+    requests: Option<UnboundedReceiver<PhoneRequest>>,
     /// Last `(pc_active, mic_wanted)` sent to the audio thread.
     audio_demand: Option<(bool, bool)>,
     /// Last seen `(underruns, lost)` of each PC's audio stream, to log glitches as they happen.
@@ -160,6 +170,10 @@ impl Manager {
                     }
                 }
                 () = self.kick.notified() => {}
+                req = next_request(&mut self.requests) => match req {
+                    Some(req) => self.listener.remote(req),
+                    None => self.requests = None,
+                },
                 () = sleep_until(self.retry_at) => {
                     self.retry_at = None;
                     self.try_start().await;
@@ -184,6 +198,11 @@ impl Manager {
                     self.try_start().await;
                 }
             }
+            Cmd::MicState { enabled, ready } => {
+                if self.set_phone(PhoneControls { mic: enabled, mic_ready: ready, ..self.phone }) {
+                    log::info!("phone mic: enabled={enabled} ready={ready}");
+                }
+            }
             Cmd::SetMuted(ids) => {
                 log::info!("muted PCs: {ids:?}");
                 self.muted = ids;
@@ -191,12 +210,17 @@ impl Manager {
                     hub.set_muted(self.muted.clone());
                 }
             }
-            Cmd::MicAllowed(allowed) => {
-                self.mic_allowed = allowed;
-                if let Some(hub) = &self.hub {
-                    hub.set_mic_enabled(allowed);
-                }
+            Cmd::Volume(volume) => {
+                self.set_phone(PhoneControls { volume, ..self.phone });
             }
+            Cmd::ControlPc { peer_id, req } => match &self.hub {
+                Some(hub) => {
+                    if !hub.request_pc(&peer_id, req) {
+                        log::info!("remote control {req:?} not sent: PC {peer_id} is not connected");
+                    }
+                }
+                None => log::info!("remote control {req:?} not sent: hub not running"),
+            },
             Cmd::NetworkChanged => {
                 if let Some(hub) = &self.hub {
                     hub.network_changed();
@@ -212,6 +236,18 @@ impl Manager {
         self.peers.iter().map(|p| p.info.clone()).collect()
     }
 
+    /// Stores new phone-side controls and tells the hub (and so every PC); `false` if nothing changed.
+    fn set_phone(&mut self, phone: PhoneControls) -> bool {
+        if phone == self.phone {
+            return false;
+        }
+        self.phone = phone;
+        if let Some(hub) = &self.hub {
+            hub.set_phone_controls(phone);
+        }
+        true
+    }
+
     async fn try_start(&mut self) {
         if self.peers.is_empty() || self.hub.is_some() {
             return;
@@ -219,7 +255,8 @@ impl Manager {
         let cfg = HubConfig { data_dir: self.data_dir.clone(), device_name: self.device_name.clone() };
         match Hub::start(cfg).await {
             Ok(hub) => {
-                hub.set_mic_enabled(self.mic_allowed);
+                hub.set_phone_controls(self.phone);
+                self.requests = hub.take_requests();
                 hub.set_muted(self.muted.clone());
                 hub.set_peers(self.peer_infos());
                 let _ = self.audio.send(Event::Attach { playout: hub.pc_audio_playout(), capture: hub.mic_capture() });
@@ -246,6 +283,7 @@ impl Manager {
         self.retry_at = None;
         self.start_error = None;
         self.status_rx = None;
+        self.requests = None;
         if let Some(hub) = self.hub.take() {
             hub.shutdown().await;
             log::info!("hub stopped");
@@ -259,7 +297,7 @@ impl Manager {
         let view = match (&self.hub, &mut self.status_rx) {
             (Some(_), Some(rx)) => {
                 let status = rx.borrow_and_update();
-                let demand = (status.pc_audio_active, mic_should_capture(&status, self.mic_allowed));
+                let demand = (status.pc_audio_active, mic_should_capture(&status, self.phone.mic_allowed()));
                 if self.audio_demand != Some(demand) {
                     self.audio_demand = Some(demand);
                     let _ = self.audio.send(Event::Update { pc_active: demand.0, mic_wanted: demand.1 });
@@ -282,7 +320,7 @@ impl Manager {
                 StatusView::from_hub(&status, configured, capturing)
             }
             _ if !self.peers.is_empty() => {
-                StatusView::starting(configured, self.mic_allowed, self.start_error.as_deref())
+                StatusView::starting(configured, self.phone.mic_allowed(), self.start_error.as_deref())
             }
             _ => StatusView::idle(),
         };
@@ -299,6 +337,14 @@ async fn status_changed(rx: &mut Option<watch::Receiver<HubStatus>>, closed: boo
     match rx {
         Some(rx) if !closed => rx.changed().await.is_ok(),
         _ => pending().await,
+    }
+}
+
+/// The next remote-control request (`None` once the hub dropped its sender); never resolves without a receiver.
+async fn next_request(rx: &mut Option<UnboundedReceiver<PhoneRequest>>) -> Option<PhoneRequest> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => pending().await,
     }
 }
 

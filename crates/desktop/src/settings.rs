@@ -13,11 +13,20 @@ pub struct Settings {
     /// Endpoint id of the last default playback device that was not VB-CABLE, so a CABLE
     /// hijack of the default device (common right after installing VB-CABLE) can be undone.
     pub last_default_render: Option<String>,
+    /// Endpoint id of the last default recording device that was not VB-CABLE, restored when the
+    /// virtual mic stops being the default microphone.
+    pub last_default_capture: Option<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { autostart: true, pc_audio_enabled: true, mic_enabled: true, last_default_render: None }
+        Self {
+            autostart: true,
+            pc_audio_enabled: true,
+            mic_enabled: true,
+            last_default_render: None,
+            last_default_capture: None,
+        }
     }
 }
 

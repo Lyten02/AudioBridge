@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use audiobridge_core::pairing::PairingInfo;
-use audiobridge_core::session::{ConnState, Hub, HubConfig, NetOptions, StreamStats};
+use audiobridge_core::session::{ConnState, Hub, HubConfig, NetOptions, PhoneControls, StreamStats};
 use parking_lot::Mutex;
 
 const BLOCK: usize = 480;
@@ -119,7 +119,8 @@ async fn main() -> Result<()> {
     )
     .await?;
     hub.set_peers(vec![pairing]);
-    hub.set_mic_enabled(args.mic_sine.is_some());
+    let mic = args.mic_sine.is_some();
+    hub.set_phone_controls(PhoneControls { mic, mic_ready: mic, volume: None });
 
     let stop = Arc::new(AtomicBool::new(false));
     let meter = Arc::new(Mutex::new(Meter::default()));

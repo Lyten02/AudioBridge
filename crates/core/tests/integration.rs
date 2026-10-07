@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 use audiobridge_core::audio::{CaptureHandle, PlayoutHandle};
 use audiobridge_core::pairing::PairingInfo;
 use audiobridge_core::session::{
-    ConnState, Hub, HubConfig, HubStatus, NetOptions, PathKind, Server, ServerConfig, Status,
+    ConnState, Hub, HubConfig, HubStatus, NetOptions, PathKind, PcRequest, PhoneControls, PhoneRequest, Server,
+    ServerConfig, Status, Volume,
 };
 use tokio::sync::watch;
 
@@ -608,6 +609,82 @@ async fn wrong_secret_is_rejected() {
     assert_ne!(peer(&h, &id).unwrap().state, ConnState::Connected);
     assert_ne!(server.status().borrow().state, ConnState::Connected);
     hub.shutdown().await;
+    server.shutdown().await;
+}
+
+async fn next<T>(rx: &mut tokio::sync::mpsc::UnboundedReceiver<T>) -> T {
+    tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("request timed out")
+        .expect("request channel closed")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_control_in_both_directions() {
+    init_logs();
+    let sdir = tempfile::tempdir().unwrap();
+    let cdir = tempfile::tempdir().unwrap();
+    let server = start_server(sdir.path(), "TEST-PC", NetOptions::local_only()).await;
+    let mut pc_requests = server.take_requests().expect("requests");
+    assert!(server.take_requests().is_none(), "requests are handed out once");
+    let pairing = pairing_of(&server);
+    let id = pairing.peer_id();
+
+    // state reported before the phone connects arrives in the handshake
+    server.set_volume(Some(Volume { level: 30, muted: false }));
+    let hub = Hub::start_with_options(
+        HubConfig { data_dir: cdir.path().to_path_buf(), device_name: "Test Phone".into() },
+        NetOptions::local_only(),
+    )
+    .await
+    .unwrap();
+    let mut phone_requests = hub.take_requests().expect("requests");
+    let mut phone = PhoneControls { mic: false, mic_ready: true, volume: Some(50) };
+    hub.set_phone_controls(phone);
+    assert!(!hub.request_pc(&id, PcRequest::Audio(false)), "not connected yet");
+    assert!(!server.request_phone(PhoneRequest::Mic(true)), "no phone yet");
+    hub.set_peers(vec![pairing]);
+
+    let mut hs = hub.status();
+    let mut ss = server.status();
+    wait_for(&mut hs, Duration::from_secs(10), "connected", |h| {
+        peer(h, &id).is_some_and(|s| s.state == ConnState::Connected && s.pc.volume.is_some_and(|v| v.level == 30))
+    })
+    .await;
+    let s = wait_for(&mut ss, Duration::from_secs(5), "phone controls", |s| s.phone == Some(phone)).await;
+    assert!(!s.mic_enabled, "phone mic is off, so the effective mic is off");
+
+    // PC -> phone: request reaches the hub; the app applies it and the result flows back
+    assert!(server.request_phone(PhoneRequest::Mic(true)));
+    assert!(server.request_phone(PhoneRequest::Volume(80)));
+    assert_eq!(next(&mut phone_requests).await, PhoneRequest::Mic(true));
+    assert_eq!(next(&mut phone_requests).await, PhoneRequest::Volume(80));
+    phone = PhoneControls { mic: true, mic_ready: true, volume: Some(80) };
+    hub.set_phone_controls(phone);
+    let s = wait_for(&mut ss, Duration::from_secs(5), "phone mic on", |s| s.phone == Some(phone)).await;
+    assert!(s.mic_enabled);
+
+    // phone -> PC: requests arrive in order; applied state flows back to the phone
+    for req in [PcRequest::Audio(false), PcRequest::Mic(true), PcRequest::Volume(55), PcRequest::Mute(true)] {
+        assert!(hub.request_pc(&id, req));
+    }
+    for want in [PcRequest::Audio(false), PcRequest::Mic(true), PcRequest::Volume(55), PcRequest::Mute(true)] {
+        assert_eq!(next(&mut pc_requests).await, want);
+    }
+    server.set_pc_audio_enabled(false);
+    server.set_mic_default(true);
+    server.set_volume(Some(Volume { level: 55, muted: true }));
+    let h = wait_for(&mut hs, Duration::from_secs(5), "PC controls", |h| {
+        peer(h, &id).is_some_and(|s| {
+            !s.pc.audio && s.pc.mic_default && s.pc.volume == Some(Volume { level: 55, muted: true })
+        })
+    })
+    .await;
+    assert!(!peer(&h, &id).unwrap().pc_audio_enabled);
+    assert_eq!(peer(&h, &id).unwrap().phone, None, "phone side never fills `phone`");
+
+    hub.shutdown().await;
+    wait_for(&mut ss, Duration::from_secs(10), "phone gone", |s| s.phone.is_none()).await;
     server.shutdown().await;
 }
 
