@@ -81,6 +81,9 @@ class MainActivity : ComponentActivity() {
                 val micForeground by StatusHub.micForeground.collectAsStateWithLifecycle()
                 val micEnabled by prefs.micEnabled.collectAsStateWithLifecycle()
                 val autostartDone by prefs.autostartDone.collectAsStateWithLifecycle()
+                val headset by prefs.headset.collectAsStateWithLifecycle()
+                val headsetTarget by StatusHub.mediaTargetId.collectAsStateWithLifecycle()
+                val lastMediaKey by StatusHub.lastMediaKey.collectAsStateWithLifecycle()
                 val version = systemStateVersion.intValue
 
                 val micPermission = remember(version) { hasPermission(Manifest.permission.RECORD_AUDIO) }
@@ -102,6 +105,11 @@ class MainActivity : ComponentActivity() {
                     onMuteAll = ::setAllMuted,
                     onMicToggle = ::setMic,
                     onPcControl = ::controlPc,
+                    headset = headset,
+                    headsetTargetId = headsetTarget,
+                    lastMediaKey = lastMediaKey,
+                    // The service observes the settings and applies them right away.
+                    onHeadsetChange = prefs::setHeadset,
                 )
             }
         }

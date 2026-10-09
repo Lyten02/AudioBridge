@@ -27,6 +27,27 @@ enum class PathKind(val wire: String) {
     }
 }
 
+/** Playback state of a PC's current media session (statusJson `peers[].media.playback`). */
+enum class PcPlayback(val wire: String) {
+    /** No media session on the PC, an older PC app, or disconnected. */
+    None("none"),
+    Stopped("stopped"),
+    Paused("paused"),
+    Playing("playing");
+
+    companion object {
+        fun fromWire(value: String): PcPlayback? = entries.firstOrNull { it.wire == value }
+    }
+}
+
+/** What a PC's current media session plays; strings are empty while unknown. */
+data class PcMedia(
+    val playback: PcPlayback = PcPlayback.None,
+    val app: String = "",
+    val title: String = "",
+    val artist: String = "",
+)
+
 /** What the UI and the notification show for a connection. */
 enum class Reachability { Connecting, Connected, Offline }
 
@@ -55,6 +76,8 @@ data class PeerStatus(
     /** The PC's default playback device volume in percent (0..100); null while unknown. */
     val pcVolume: Int? = null,
     val pcMuted: Boolean = false,
+    /** The PC's current media session; headphone buttons control it. */
+    val media: PcMedia = PcMedia(),
     val pcAudio: StreamStats = StreamStats(),
     val mic: StreamStats = StreamStats(),
     val error: String? = null,
@@ -124,9 +147,20 @@ data class BridgeStatus(
                 micDefault = o.getBoolean("micDefault"),
                 pcVolume = if (o.isNull("pcVolume")) null else o.getInt("pcVolume"),
                 pcMuted = o.getBoolean("pcMuted"),
+                media = parseMedia(o.getJSONObject("media")),
                 pcAudio = parseStream(o.getJSONObject("pcAudio")),
                 mic = parseStream(o.getJSONObject("mic")),
                 error = o.optStringOrNull("error"),
+            )
+        }
+
+        private fun parseMedia(o: JSONObject): PcMedia {
+            val wire = o.getString("playback")
+            return PcMedia(
+                playback = PcPlayback.fromWire(wire) ?: throw IllegalArgumentException("unknown playback: $wire"),
+                app = o.getString("app"),
+                title = o.getString("title"),
+                artist = o.getString("artist"),
             )
         }
 

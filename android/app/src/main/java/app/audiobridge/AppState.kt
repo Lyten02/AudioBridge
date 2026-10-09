@@ -20,6 +20,9 @@ class Prefs private constructor(private val sp: SharedPreferences) {
     private val _autostartDone = MutableStateFlow(sp.getBoolean(KEY_AUTOSTART_DONE, false))
     val autostartDone: StateFlow<Boolean> = _autostartDone.asStateFlow()
 
+    private val _headset = MutableStateFlow(readHeadset(sp))
+    val headset: StateFlow<HeadsetSettings> = _headset.asStateFlow()
+
     private fun readPcs(): List<PairedPc> {
         val legacyUri = sp.getString(KEY_LEGACY_URI, null) ?: return PairedPc.decodeList(sp.getString(KEY_PCS, null))
         // v1 stored a single PC; fold it into the list once.
@@ -70,12 +73,43 @@ class Prefs private constructor(private val sp: SharedPreferences) {
         _autostartDone.value = done
     }
 
+    @Synchronized
+    fun setHeadset(settings: HeadsetSettings) {
+        sp.edit { writeHeadset(this, settings) }
+        _headset.value = settings
+    }
+
     companion object {
         private const val KEY_PCS = "paired_pcs"
         private const val KEY_LEGACY_URI = "pairing_uri"
         private const val KEY_LEGACY_PC_NAME = "pc_name"
         private const val KEY_MIC = "mic_enabled"
         private const val KEY_AUTOSTART_DONE = "autostart_done"
+        private const val KEY_HEADSET_ENABLED = "headset_enabled"
+        private const val KEY_HEADSET_SINGLE = "headset_single_earbud"
+        private const val KEY_HEADSET_DOUBLE = "headset_double_tap"
+        private const val KEY_HEADSET_TRIPLE = "headset_triple_tap"
+        private const val KEY_HEADSET_TARGET = "headset_target"
+
+        /** Reads the headphone-button settings; missing or unknown values fall back to the defaults. */
+        fun readHeadset(sp: SharedPreferences): HeadsetSettings {
+            val d = HeadsetSettings()
+            return HeadsetSettings(
+                enabled = sp.getBoolean(KEY_HEADSET_ENABLED, d.enabled),
+                singleEarbud = sp.getBoolean(KEY_HEADSET_SINGLE, d.singleEarbud),
+                doubleTap = TapAction.fromPref(sp.getString(KEY_HEADSET_DOUBLE, null), d.doubleTap),
+                tripleTap = TapAction.fromPref(sp.getString(KEY_HEADSET_TRIPLE, null), d.tripleTap),
+                targetId = sp.getString(KEY_HEADSET_TARGET, null),
+            )
+        }
+
+        fun writeHeadset(editor: SharedPreferences.Editor, s: HeadsetSettings) {
+            editor.putBoolean(KEY_HEADSET_ENABLED, s.enabled)
+            editor.putBoolean(KEY_HEADSET_SINGLE, s.singleEarbud)
+            editor.putString(KEY_HEADSET_DOUBLE, s.doubleTap.pref)
+            editor.putString(KEY_HEADSET_TRIPLE, s.tripleTap.pref)
+            if (s.targetId == null) editor.remove(KEY_HEADSET_TARGET) else editor.putString(KEY_HEADSET_TARGET, s.targetId)
+        }
 
         @Volatile
         private var instance: Prefs? = null
@@ -94,6 +128,12 @@ object StatusHub {
 
     /** The service holds the microphone FGS type and RECORD_AUDIO is granted (mic ready); capture also needs the switch. */
     val micForeground = MutableStateFlow(false)
+
+    /** The PC the headphone buttons control right now (null: none), resolved by the service. */
+    val mediaTargetId = MutableStateFlow<String?>(null)
+
+    /** The last headphone command the service handled, for the settings screen. */
+    val lastMediaKey = MutableStateFlow<MediaKeyLog?>(null)
 }
 
 object Native {

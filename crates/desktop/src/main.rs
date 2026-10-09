@@ -16,6 +16,7 @@ mod cable_install;
 mod autostart;
 mod icon;
 mod instance;
+mod media;
 mod paths;
 mod settings;
 mod shared;
@@ -126,6 +127,8 @@ fn run(primary: instance::Primary, background: bool, data_dir: &Path) -> Result<
 
     let (main_tx, main_rx) = mpsc::channel();
     let sh = shared::init(data_dir.to_path_buf(), pc_name, server, settings, main_tx);
+    let media = media::MediaTransport::spawn(|state| shared().set_media_state(state))?;
+    sh.set_media_sender(media.sender());
 
     let audio = AudioEngine::spawn(
         capture,
@@ -168,6 +171,7 @@ fn run(primary: instance::Primary, background: bool, data_dir: &Path) -> Result<
     tracing::info!("shutting down");
     tray.quit();
     audio.shutdown();
+    media.shutdown();
     if let Some(server) = sh.take_server() {
         rt.block_on(async {
             if tokio::time::timeout(Duration::from_secs(3), server.shutdown()).await.is_err() {

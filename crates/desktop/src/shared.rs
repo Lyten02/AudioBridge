@@ -7,7 +7,7 @@ use std::sync::{Mutex, OnceLock};
 
 use audiobridge_core::pairing::PairingInfo;
 use audiobridge_core::proto::MAX_LEVEL;
-use audiobridge_core::session::{ConnState, PcRequest, PhoneRequest, Server, Status, Volume};
+use audiobridge_core::session::{ConnState, PcMedia, PcRequest, PhoneRequest, Server, Status, Volume};
 use tokio::sync::watch;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -40,6 +40,7 @@ pub struct Shared {
     main_tx: Sender<MainCmd>,
     exiting: AtomicBool,
     audio_tx: Mutex<Option<Sender<AudioMsg>>>,
+    media_tx: Mutex<Option<crate::media::Sender>>,
     cable_install: Mutex<InstallState>,
 }
 
@@ -75,6 +76,7 @@ pub fn init(
         main_tx,
         exiting: AtomicBool::new(false),
         audio_tx: Mutex::new(None),
+        media_tx: Mutex::new(None),
         cable_install: Mutex::new(InstallState::Idle),
     };
     if SHARED.set(state).is_err() {
@@ -177,6 +179,14 @@ impl Shared {
         self.with_server(|s| s.set_volume(v));
     }
 
+    pub fn set_media_state(&self, media: PcMedia) {
+        self.with_server(|s| s.set_media(media));
+    }
+
+    pub fn set_media_sender(&self, sender: crate::media::Sender) {
+        *lock(&self.media_tx) = Some(sender);
+    }
+
     /// Switches the connected phone's mic.
     pub fn set_phone_mic(&self, on: bool) {
         self.request_phone(PhoneRequest::Mic(on));
@@ -198,6 +208,7 @@ impl Shared {
     /// Applies a remote-control request from the phone; results flow back through `Status`.
     pub fn apply_request(&'static self, req: PcRequest) {
         match req {
+            PcRequest::Media(_) => {}
             PcRequest::Volume(_) => tracing::debug!("phone request: {req:?}"),
             _ => tracing::info!("phone request: {req:?}"),
         }
@@ -207,6 +218,11 @@ impl Shared {
             PcRequest::MicDefault(on) => self.set_mic_default(on),
             PcRequest::Volume(level) => self.set_volume(level),
             PcRequest::Mute(muted) => self.set_mute(muted),
+            PcRequest::Media(command) => {
+                if let Some(sender) = lock(&self.media_tx).as_ref() {
+                    sender.send(command);
+                }
+            }
         }
     }
 

@@ -20,7 +20,8 @@ use crate::audio::tx::TxStats;
 use crate::audio::{CaptureHandle, IncomingStream, OutgoingStream, PlayoutHandle};
 use crate::pairing::PairingInfo;
 use crate::proto::{
-    ControlMsg, PcControls, PcRequest, PhoneControls, PhoneRequest, StreamId, Volume, PROTOCOL_VERSION,
+    ControlMsg, PcControls, PcMedia, PcRequest, PhoneControls, PhoneRequest, StreamId, Volume,
+    PROTOCOL_VERSION,
 };
 
 const PC_AUDIO_BITRATE: i32 = 192_000;
@@ -54,6 +55,8 @@ pub(super) struct Inner {
     status_tx: Arc<watch::Sender<Status>>,
     status: StatusCell,
     toggles: watch::Sender<Toggles>,
+    /// The PC's current media session (reported to the phone).
+    media: watch::Sender<PcMedia>,
     /// Controls of the connected phone (`None` without a phone).
     phone: Mutex<Option<PhoneControls>>,
     /// Requests from the phone, for the app to apply.
@@ -96,6 +99,7 @@ impl Server {
             status_tx,
             status,
             toggles: watch::channel(toggles).0,
+            media: watch::channel(PcMedia::default()).0,
             phone: Mutex::new(None),
             requests: requests_tx,
             pc_audio: OutgoingStream::new(StreamId::PcAudio, PC_AUDIO_BITRATE, PC_AUDIO_COMPLEXITY)?,
@@ -156,6 +160,20 @@ impl Server {
     /// Default playback device volume (reported to the phone); `None` while unknown.
     pub fn set_volume(&self, volume: Option<Volume>) {
         self.inner.set_toggles(|t| t.pc.volume = volume);
+    }
+
+    /// The PC's current media session (reported to the phone; only changes are sent).
+    pub fn set_media(&self, media: PcMedia) {
+        let changed = self.inner.media.send_if_modified(|m| {
+            if *m == media {
+                return false;
+            }
+            *m = media.clone();
+            true
+        });
+        if changed {
+            self.inner.status.update(|s| s.media = media);
+        }
     }
 
     /// Remote-control requests from the phone. The server does not apply them; the app does
@@ -444,6 +462,10 @@ impl Inner {
         let mut toggles_rx = self.toggles.subscribe();
         // the toggles may have changed between Welcome and now
         toggles_rx.mark_changed();
+        // the Welcome carries no media state: send it right away unless there is none
+        let mut media_rx = self.media.subscribe();
+        media_rx.mark_changed();
+        let mut sent_media = PcMedia::default();
         loop {
             tokio::select! {
                 msg = incoming.recv() => match msg {
@@ -477,6 +499,14 @@ impl Inner {
                         ControlMsg::MicDemand(t.mic_demand).write_to(&mut send).await?;
                     }
                     sent = t;
+                }
+                r = media_rx.changed() => {
+                    r?;
+                    let now = media_rx.borrow_and_update().clone();
+                    if now != sent_media {
+                        ControlMsg::PcMedia(now.clone()).write_to(&mut send).await?;
+                        sent_media = now;
+                    }
                 }
             }
         }

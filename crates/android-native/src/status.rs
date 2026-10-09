@@ -2,16 +2,18 @@
 //!
 //! Schema (all keys always present):
 //! `{"state","micEnabled","micCapturing","micWanted","pcAudioActive","peers":[{"id","name","state","path","rttMs",
-//! "pcAudioEnabled","micEnabled","micDemanded","pcMic","micDefault","pcVolume","pcMuted","pcAudio":{...},"mic":{...},
-//! "error"}]}`
+//! "pcAudioEnabled","micEnabled","micDemanded","pcMic","micDefault","pcVolume","pcMuted","media":{...},"pcAudio":{...},
+//! "mic":{...},"error"}]}`
 //!
 //! Remote controls of each PC as it last reported them: `pcMic` is its own mic switch (`micEnabled` stays the
 //! effective state), `micDefault` = its virtual mic is the Windows default recording device, `pcVolume` = its default
 //! playback device volume in percent (`null` while unknown), `pcMuted` = that device is muted.
+//! `media` = `{"playback","app","title","artist"}`: the PC's current media session; `playback` is one of
+//! `none|stopped|paused|playing` (`none` also while disconnected), strings are empty while unknown.
 
 use std::time::{Duration, Instant};
 
-use audiobridge_core::session::{ConnState, HubStatus, PathKind, Status, StreamStats};
+use audiobridge_core::session::{ConnState, HubStatus, PathKind, PcMedia, Playback, Status, StreamStats};
 use serde::Serialize;
 
 /// Minimum spacing between two listener calls.
@@ -43,6 +45,35 @@ impl StreamView {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaView {
+    pub playback: &'static str,
+    pub app: String,
+    pub title: String,
+    pub artist: String,
+}
+
+impl MediaView {
+    fn none() -> Self {
+        MediaView::from_media(&PcMedia::default())
+    }
+
+    fn from_media(m: &PcMedia) -> Self {
+        MediaView {
+            playback: match m.playback {
+                Playback::None => "none",
+                Playback::Stopped => "stopped",
+                Playback::Paused => "paused",
+                Playback::Playing => "playing",
+            },
+            app: m.app.clone(),
+            title: m.title.clone(),
+            artist: m.artist.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PeerView {
@@ -61,6 +92,8 @@ pub struct PeerView {
     /// The PC's default playback device volume in percent; `None` while unknown.
     pub pc_volume: Option<u8>,
     pub pc_muted: bool,
+    /// The PC's current media session (headphone buttons control it).
+    pub media: MediaView,
     pub pc_audio: StreamView,
     pub mic: StreamView,
     pub error: Option<String>,
@@ -82,6 +115,7 @@ impl PeerView {
             mic_default: s.pc.mic_default,
             pc_volume: s.pc.volume.map(|v| v.level),
             pc_muted: s.pc.volume.is_some_and(|v| v.muted),
+            media: MediaView::from_media(&s.media),
             pc_audio: StreamView::from_stats(&s.pc_audio),
             mic: StreamView::from_stats(&s.mic),
             error: s.last_error.clone(),
@@ -103,6 +137,7 @@ impl PeerView {
             mic_default: false,
             pc_volume: None,
             pc_muted: false,
+            media: MediaView::none(),
             pc_audio: StreamView::IDLE,
             mic: StreamView::IDLE,
             error,
@@ -122,6 +157,7 @@ impl PeerView {
             && self.mic_default == o.mic_default
             && self.pc_volume == o.pc_volume
             && self.pc_muted == o.pc_muted
+            && self.media == o.media
             && self.pc_audio.active == o.pc_audio.active
             && self.mic.active == o.mic.active
             && self.error == o.error
@@ -314,7 +350,7 @@ impl NotifyGate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use audiobridge_core::session::{PcControls, PeerStatus, Volume};
+    use audiobridge_core::session::{PcControls, PcMedia, PeerStatus, Playback, Volume};
 
     fn stats(active: bool, buffer_ms: f32, kbps: f32) -> StreamStats {
         StreamStats { active, buffer_ms, underruns: 3, lost_packets: 7, kbps }
@@ -333,6 +369,12 @@ mod tests {
             mic: stats(false, 0.0, 0.0),
             pc: PcControls { audio: true, mic: true, mic_default: false, volume: Some(Volume { level: 64, muted: false }) },
             phone: None,
+            media: PcMedia {
+                playback: Playback::Playing,
+                app: "Яндекс Музыка".into(),
+                title: "Танцуй!".into(),
+                artist: "SATS".into(),
+            },
             last_error: None,
         }
     }
@@ -376,6 +418,7 @@ mod tests {
                 "micDefault": false,
                 "pcVolume": 64,
                 "pcMuted": false,
+                "media": {"playback": "playing", "app": "Яндекс Музыка", "title": "Танцуй!", "artist": "SATS"},
                 "pcAudio": {"active": true, "bufferMs": 31.0, "underruns": 3, "lost": 7, "kbps": 190.5},
                 "mic": {"active": false, "bufferMs": 0.0, "underruns": 3, "lost": 7, "kbps": 0.0},
                 "error": null
@@ -435,6 +478,7 @@ mod tests {
         assert_eq!(peers[1]["error"], "bind failed");
         assert!(peers[0]["path"].is_null() && peers[0]["rttMs"].is_null());
         assert_eq!(peers[0]["pcAudio"]["active"], false);
+        assert_eq!(peers[0]["media"], serde_json::json!({"playback": "none", "app": "", "title": "", "artist": ""}));
     }
 
     #[test]
@@ -463,6 +507,20 @@ mod tests {
         }
         s.path = None;
         assert_eq!(PeerView::from_status("a", "", &s).path, None);
+    }
+
+    #[test]
+    fn playback_names() {
+        let mut s = connected(None);
+        for (playback, name) in [
+            (Playback::None, "none"),
+            (Playback::Stopped, "stopped"),
+            (Playback::Paused, "paused"),
+            (Playback::Playing, "playing"),
+        ] {
+            s.media.playback = playback;
+            assert_eq!(PeerView::from_status("a", "", &s).media.playback, name);
+        }
     }
 
     #[test]
@@ -545,6 +603,8 @@ mod tests {
             |v| v.peers[1].pc_audio.active = false,
             |v| v.peers[1].mic.active = true,
             |v| v.peers[1].error = Some("x".into()),
+            |v| v.peers[1].media.playback = "paused",
+            |v| v.peers[1].media.title = "Другой трек".into(),
         ];
         for (i, edit) in edits.into_iter().enumerate() {
             let mut v = base.clone();

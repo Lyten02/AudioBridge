@@ -74,6 +74,8 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import app.audiobridge.BridgeStatus
+import app.audiobridge.HeadsetSettings
+import app.audiobridge.MediaKeyLog
 import app.audiobridge.NativeBridge
 import app.audiobridge.PairedPc
 import app.audiobridge.PeerStatus
@@ -122,6 +124,10 @@ fun MainScreen(
     onMicToggle: (Boolean) -> Unit,
     /** Remote control of a connected PC: `NativeBridge.PC_*` action and its value. */
     onPcControl: (pcId: String, action: Int, value: Int) -> Unit,
+    headset: HeadsetSettings,
+    headsetTargetId: String?,
+    lastMediaKey: MediaKeyLog?,
+    onHeadsetChange: (HeadsetSettings) -> Unit,
 ) {
     var removeId by rememberSaveable { mutableStateOf<String?>(null) }
     val rows = pcs.map { PcRow(it, status.peer(it.id)) }
@@ -149,6 +155,7 @@ fun MainScreen(
             } else {
                 OverviewCard(rows, status, onMuteAll)
                 MicCard(rows, status, mic, onMicToggle)
+                HeadsetCard(headset, pcs, status, headsetTargetId, lastMediaKey, onHeadsetChange)
                 SectionHeader(stringResource(R.string.pcs_title), rows.size)
                 rows.forEach { row ->
                     key(row.pc.id) {
