@@ -39,6 +39,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import app.audiobridge.BridgeStatus
 import app.audiobridge.HeadsetSettings
@@ -165,6 +166,7 @@ fun HeadsetCard(
                     Text(
                         stringResource(R.string.headset_tap_1_fixed),
                         style = MaterialTheme.typography.bodyMedium,
+                        textAlign = TextAlign.End,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
@@ -196,8 +198,9 @@ private fun Note(text: String) {
 @Composable
 private fun TapRow(title: String, value: @Composable () -> Unit) {
     Row(Modifier.fillMaxWidth().padding(vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
-        Text(title, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
-        value()
+        Text(title, style = MaterialTheme.typography.bodyLarge, maxLines = 1, softWrap = false)
+        Spacer(Modifier.width(12.dp))
+        Box(Modifier.weight(1f), contentAlignment = Alignment.CenterEnd) { value() }
     }
 }
 
