@@ -28,6 +28,10 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import kotlin.math.roundToInt
+import kotlinx.coroutines.MainScope
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.launch
 
 /**
  * Keeps the native client connected in the background.
@@ -37,12 +41,17 @@ import kotlin.math.roundToInt
  * notification action ([ACTION_ENABLE_MIC]). Once held it is kept whenever RECORD_AUDIO is granted, independent of the
  * user's mic switch, so a PC can switch the mic on remotely in the background ([StatusListener.onRemoteMic]). Native
  * mic capture needs both the switch and the type ([NativeBridge.setMicState]).
+ *
+ * It also owns [HeadsetControl], the media session that forwards headphone buttons to a PC. That needs no extra FGS
+ * type or permission: media keys are delivered to the session by the system, also with the screen off.
  */
 class BridgeService : Service() {
     private val main = Handler(Looper.getMainLooper())
     private lateinit var prefs: Prefs
     private lateinit var notifications: NotificationManager
     private lateinit var audio: AudioManager
+    private lateinit var headset: HeadsetControl
+    private val scope = MainScope()
 
     /** Last JSON array handed to [NativeBridge.setPeers]. */
     private var appliedPeers: String? = null
@@ -98,6 +107,9 @@ class BridgeService : Service() {
         contentResolver.registerContentObserver(Settings.System.CONTENT_URI, true, volumeObserver)
         reportVolume()
         registerNetworkCallback()
+        headset = HeadsetControl(this, audio)
+        // Settings and the PC list change from the activity; status changes come through onStatusChanged.
+        scope.launch { combine(prefs.headset, prefs.pcs) { _, _ -> }.collect { refreshHeadset() } }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -114,7 +126,9 @@ class BridgeService : Service() {
         }
 
         val pcs = prefs.pcs.value
-        if (pcs.isEmpty()) {
+        // Switched off by the user (or nothing paired): a sticky restart or a late start must not keep it running.
+        // The foreground start above is still required before stopping (startForegroundService contract).
+        if (!prefs.shouldRun()) {
             stopSelf()
             return START_NOT_STICKY
         }
@@ -134,6 +148,9 @@ class BridgeService : Service() {
     }
 
     override fun onDestroy() {
+        scope.cancel()
+        headset.release()
+        StatusHub.mediaTargetId.value = null
         contentResolver.unregisterContentObserver(volumeObserver)
         NativeBridge.setListener(null)
         NativeBridge.setMicState(false, false)
@@ -225,6 +242,11 @@ class BridgeService : Service() {
         if (fgsType == NOT_FOREGROUND) return
         setStreamingLocks(status.isStreaming)
         refreshNotification(force = false)
+        refreshHeadset()
+    }
+
+    private fun refreshHeadset() {
+        headset.update(StatusHub.status.value, prefs.pcs.value, prefs.headset.value)
     }
 
     // region locks

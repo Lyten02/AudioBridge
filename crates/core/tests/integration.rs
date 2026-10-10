@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use audiobridge_core::audio::{CaptureHandle, PlayoutHandle};
 use audiobridge_core::pairing::PairingInfo;
 use audiobridge_core::session::{
-    ConnState, Hub, HubConfig, HubStatus, NetOptions, PathKind, PcRequest, PhoneControls, PhoneRequest, Server,
-    ServerConfig, Status, Volume,
+    ConnState, Hub, HubConfig, HubStatus, MediaCommand, NetOptions, PathKind, PcMedia, PcRequest, PhoneControls,
+    PhoneRequest, Playback, Server, ServerConfig, Status, Volume,
 };
 use tokio::sync::watch;
 
@@ -686,6 +686,83 @@ async fn remote_control_in_both_directions() {
     hub.shutdown().await;
     wait_for(&mut ss, Duration::from_secs(10), "phone gone", |s| s.phone.is_none()).await;
     server.shutdown().await;
+}
+
+/// Headphone buttons: a media command reaches only the PC it is addressed to, exactly once and
+/// in order; the PC's now-playing state flows to the phone and is cleared when the PC goes away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn media_commands_reach_only_the_target_pc_exactly_once() {
+    init_logs();
+    let (da, db, dh) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let a = start_server(da.path(), "PC-A", NetOptions::local_only()).await;
+    let b = start_server(db.path(), "PC-B", NetOptions::local_only()).await;
+    let mut ra = a.take_requests().unwrap();
+    let mut rb = b.take_requests().unwrap();
+    let (pa, pb) = (pairing_of(&a), pairing_of(&b));
+    let (ida, idb) = (pa.peer_id(), pb.peer_id());
+    // reported before the phone connects: arrives right after the handshake
+    let playing = PcMedia {
+        playback: Playback::Playing,
+        app: "Яндекс Музыка".into(),
+        title: "Танцуй!".into(),
+        artist: "SATS".into(),
+    };
+    a.set_media(playing.clone());
+    assert_eq!(a.status().borrow().media, playing);
+    let hub = start_hub(dh.path(), vec![pa, pb]).await;
+    let mut hs = hub.status();
+    let h = wait_for(&mut hs, Duration::from_secs(10), "both connected, A playing", |h| {
+        connected(h, &ida) && connected(h, &idb) && peer(h, &ida).is_some_and(|s| s.media == playing)
+    })
+    .await;
+    assert_eq!(peer(&h, &idb).unwrap().media, PcMedia::default(), "PC-B reported nothing");
+
+    let cmds = [
+        MediaCommand::Pause,
+        MediaCommand::Play,
+        MediaCommand::PlayPause,
+        MediaCommand::Next,
+        MediaCommand::Previous,
+    ];
+    for c in cmds {
+        assert!(hub.request_pc(&ida, PcRequest::Media(c)));
+    }
+    // a sentinel right behind them proves there were no duplicates in between
+    assert!(hub.request_pc(&ida, PcRequest::Audio(true)));
+    for c in cmds {
+        assert_eq!(next(&mut ra).await, PcRequest::Media(c));
+    }
+    assert_eq!(next(&mut ra).await, PcRequest::Audio(true));
+    // no fan-out: PC-B's first request is its own sentinel
+    assert!(hub.request_pc(&idb, PcRequest::Audio(true)));
+    assert_eq!(next(&mut rb).await, PcRequest::Audio(true));
+    assert!(ra.try_recv().is_err() && rb.try_recv().is_err());
+
+    // state changes reach the phone; an unchanged report sends nothing
+    let paused = PcMedia { playback: Playback::Paused, ..playing.clone() };
+    a.set_media(paused.clone());
+    a.set_media(paused.clone());
+    wait_for(&mut hs, Duration::from_secs(5), "A paused", |h| {
+        peer(h, &ida).is_some_and(|s| s.media == paused)
+    })
+    .await;
+
+    // PC-A goes away: its media state is cleared, commands for it are refused, PC-B still works
+    a.shutdown().await;
+    wait_for(&mut hs, Duration::from_secs(10), "A gone", |h| {
+        peer(h, &ida).is_some_and(|s| s.state != ConnState::Connected && s.media == PcMedia::default())
+    })
+    .await;
+    assert!(!hub.request_pc(&ida, PcRequest::Media(MediaCommand::Next)));
+    assert!(hub.request_pc(&idb, PcRequest::Media(MediaCommand::Next)));
+    assert_eq!(next(&mut rb).await, PcRequest::Media(MediaCommand::Next));
+
+    hub.shutdown().await;
+    b.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

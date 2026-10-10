@@ -11,7 +11,8 @@ pub const FRAME_SAMPLES: usize = 480;
 /// Preferred UDP port of the PC endpoint (IPv4). Falls back to a random port when busy.
 pub const DEFAULT_PORT: u16 = 47130;
 /// Control protocol version carried in `Hello`. v2: remote control (state reports + requests).
-pub const PROTOCOL_VERSION: u16 = 2;
+/// v3: media transport (phone → PC media commands, PC → phone now-playing state).
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Largest Opus payload sent or accepted. The encoder is capped to it (≈ 512 kbit/s per 10 ms
 /// frame, far above the configured bitrates), so jitter-buffer slots stay small.
@@ -175,6 +176,76 @@ pub enum PcRequest {
     MicDefault(bool),
     Volume(u8),
     Mute(bool),
+    /// Media transport command for the PC's current media session (headphone buttons).
+    Media(MediaCommand),
+}
+
+/// Media transport command, applied by the PC to its current media session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MediaCommand {
+    Play,
+    Pause,
+    /// Pause if playing, otherwise play (decided by the PC from the real state).
+    PlayPause,
+    Next,
+    Previous,
+}
+
+impl MediaCommand {
+    pub const ALL: [MediaCommand; 5] = [
+        MediaCommand::Play,
+        MediaCommand::Pause,
+        MediaCommand::PlayPause,
+        MediaCommand::Next,
+        MediaCommand::Previous,
+    ];
+
+    /// Stable wire / JNI code.
+    pub fn code(self) -> u8 {
+        match self {
+            MediaCommand::Play => 0,
+            MediaCommand::Pause => 1,
+            MediaCommand::PlayPause => 2,
+            MediaCommand::Next => 3,
+            MediaCommand::Previous => 4,
+        }
+    }
+
+    pub fn from_code(code: u8) -> Option<MediaCommand> {
+        Self::ALL.into_iter().find(|c| c.code() == code)
+    }
+}
+
+/// Playback state of the PC's current media session.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Playback {
+    /// No media session on the PC (or not reported yet).
+    #[default]
+    None,
+    Stopped,
+    Paused,
+    Playing,
+}
+
+impl Playback {
+    fn code(self) -> u8 {
+        match self {
+            Playback::None => 0,
+            Playback::Stopped => 1,
+            Playback::Paused => 2,
+            Playback::Playing => 3,
+        }
+    }
+}
+
+/// What the PC's current media session plays (PC → phone).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PcMedia {
+    pub playback: Playback,
+    /// Player name (e.g. "Яндекс Музыка"); empty while unknown.
+    pub app: String,
+    pub title: String,
+    pub artist: String,
 }
 
 /// PC → phone: change a phone-side control.
@@ -213,6 +284,8 @@ pub enum ControlMsg {
     SetPc(PcRequest),
     /// PC → phone: remote-control request.
     SetPhone(PhoneRequest),
+    /// PC → phone: the PC's media session changed (v3).
+    PcMedia(PcMedia),
 }
 
 const MAX_CONTROL_LEN: usize = 1024;
@@ -271,6 +344,7 @@ impl ControlMsg {
                     PcRequest::MicDefault(on) => (2, on as u8),
                     PcRequest::Volume(level) => (3, level.min(MAX_LEVEL)),
                     PcRequest::Mute(on) => (4, on as u8),
+                    PcRequest::Media(cmd) => (5, cmd.code()),
                 };
                 body.extend_from_slice(&[kind, value]);
             }
@@ -281,6 +355,13 @@ impl ControlMsg {
                     PhoneRequest::Volume(level) => (1, level.min(MAX_LEVEL)),
                 };
                 body.extend_from_slice(&[kind, value]);
+            }
+            ControlMsg::PcMedia(media) => {
+                body.push(9);
+                body.push(media.playback.code());
+                put_str(&mut body, &media.app);
+                put_str(&mut body, &media.title);
+                put_str(&mut body, &media.artist);
             }
         }
         let mut out = Vec::with_capacity(body.len() + 2);
@@ -322,12 +403,27 @@ impl ControlMsg {
                 2 => PcRequest::MicDefault(r.bool()?),
                 3 => PcRequest::Volume(r.level()?),
                 4 => PcRequest::Mute(r.bool()?),
+                5 => PcRequest::Media(
+                    MediaCommand::from_code(r.u8()?).context("unknown media command")?,
+                ),
                 k => bail!("unknown PC request {k}"),
             }),
             8 => ControlMsg::SetPhone(match r.u8()? {
                 0 => PhoneRequest::Mic(r.bool()?),
                 1 => PhoneRequest::Volume(r.level()?),
                 k => bail!("unknown phone request {k}"),
+            }),
+            9 => ControlMsg::PcMedia(PcMedia {
+                playback: match r.u8()? {
+                    0 => Playback::None,
+                    1 => Playback::Stopped,
+                    2 => Playback::Paused,
+                    3 => Playback::Playing,
+                    v => bail!("bad playback state {v}"),
+                },
+                app: r.string()?,
+                title: r.string()?,
+                artist: r.string()?,
             }),
             t => bail!("unknown control message tag {t}"),
         };
@@ -527,8 +623,20 @@ mod tests {
             ControlMsg::SetPc(PcRequest::MicDefault(false)),
             ControlMsg::SetPc(PcRequest::Volume(0)),
             ControlMsg::SetPc(PcRequest::Mute(true)),
+            ControlMsg::SetPc(PcRequest::Media(MediaCommand::Play)),
+            ControlMsg::SetPc(PcRequest::Media(MediaCommand::Pause)),
+            ControlMsg::SetPc(PcRequest::Media(MediaCommand::PlayPause)),
+            ControlMsg::SetPc(PcRequest::Media(MediaCommand::Next)),
+            ControlMsg::SetPc(PcRequest::Media(MediaCommand::Previous)),
             ControlMsg::SetPhone(PhoneRequest::Mic(false)),
             ControlMsg::SetPhone(PhoneRequest::Volume(100)),
+            ControlMsg::PcMedia(PcMedia::default()),
+            ControlMsg::PcMedia(PcMedia {
+                playback: Playback::Playing,
+                app: "Яндекс Музыка".into(),
+                title: "Танцуй!".into(),
+                artist: "SATS".into(),
+            }),
         ];
         for m in msgs {
             let enc = m.encode();
@@ -551,6 +659,35 @@ mod tests {
         // mute without a known volume is not canonical
         assert!(ControlMsg::decode(&[4, 1, 1, 0, 0xFF, 1]).is_err());
         assert_eq!(ControlMsg::decode(&[4, 1, 1, 0, 0xFF, 0]).unwrap(), ControlMsg::PcState(PcControls::default()));
+        // unknown media commands and playback states are rejected
+        assert!(ControlMsg::decode(&[7, 5, 5]).is_err());
+        assert!(ControlMsg::decode(&[9, 4, 0, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn media_codes_are_stable() {
+        // the Android app passes these codes over JNI; they must never be renumbered
+        let codes: Vec<u8> = MediaCommand::ALL.iter().map(|c| c.code()).collect();
+        assert_eq!(codes, [0, 1, 2, 3, 4]);
+        for c in MediaCommand::ALL {
+            assert_eq!(MediaCommand::from_code(c.code()), Some(c));
+        }
+        assert_eq!(MediaCommand::from_code(5), None);
+    }
+
+    #[test]
+    fn long_media_strings_are_truncated_on_a_char_boundary() {
+        let long = "я".repeat(200); // 400 bytes
+        let enc = ControlMsg::PcMedia(PcMedia {
+            playback: Playback::Paused,
+            app: long.clone(),
+            title: long.clone(),
+            artist: long,
+        })
+        .encode();
+        assert!(enc.len() - 2 <= MAX_CONTROL_LEN);
+        let ControlMsg::PcMedia(m) = ControlMsg::decode(&enc[2..]).unwrap() else { panic!() };
+        assert_eq!(m.title, "я".repeat(MAX_NAME_LEN / 2));
     }
 
     #[test]
@@ -563,5 +700,21 @@ mod tests {
             panic!("not a Hello");
         };
         assert_eq!((version, device_name.as_str(), phone), (1, "P5", PhoneControls::default()));
+    }
+
+    #[test]
+    fn v2_hello_is_still_readable_for_a_reject() {
+        // v2 phones send the same Hello layout; the PC must see version 2 to reject it
+        let mut v2 = ControlMsg::Hello {
+            version: 2,
+            secret: [1; 16],
+            device_name: "Old".into(),
+            phone: PhoneControls { mic: true, mic_ready: true, volume: Some(5) },
+        }
+        .encode();
+        let ControlMsg::Hello { version, device_name, .. } = ControlMsg::decode(&v2.split_off(2)).unwrap() else {
+            panic!("not a Hello");
+        };
+        assert_eq!((version, device_name.as_str()), (2, "Old"));
     }
 }

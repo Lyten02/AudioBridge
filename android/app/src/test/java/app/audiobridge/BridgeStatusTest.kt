@@ -21,11 +21,12 @@ class BridgeStatusTest {
         micDefault: Boolean = false,
         pcVolume: String = "64",
         pcMuted: Boolean = false,
+        media: String = """{"playback":"playing","app":"Яндекс Музыка","title":"Танцуй!","artist":"SATS"}""",
         error: String = "null",
     ) = """
         {"id":"$id","name":"$name","state":"$state","path":$path,"rttMs":$rtt,"pcAudioEnabled":true,
          "micEnabled":$micEnabled,"micDemanded":$micDemanded,"pcMic":$pcMic,"micDefault":$micDefault,
-         "pcVolume":$pcVolume,"pcMuted":$pcMuted,
+         "pcVolume":$pcVolume,"pcMuted":$pcMuted,"media":$media,
          "pcAudio":{"active":$pcActive,"bufferMs":31.0,"underruns":2,"lost":7,"kbps":190.5},
          "mic":{"active":false,"bufferMs":0,"underruns":0,"lost":0,"kbps":0},
          "error":$error}
@@ -77,6 +78,21 @@ class BridgeStatusTest {
         assertFalse(unknown.pcMic)
         assertNull(unknown.pcVolume)
         assertFalse(unknown.pcMuted)
+    }
+
+    @Test
+    fun parsesPcMedia() {
+        val p = BridgeStatus.parse(hub()).peers[0]
+        assertEquals(PcMedia(PcPlayback.Playing, "Яндекс Музыка", "Танцуй!", "SATS"), p.media)
+        for (playback in PcPlayback.entries) {
+            val media = """{"playback":"${playback.wire}","app":"","title":"","artist":""}"""
+            assertEquals(PcMedia(playback), BridgeStatus.parse(hub(peers = listOf(peer(media = media)))).peers[0].media)
+        }
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun unknownPlaybackIsRejected() {
+        BridgeStatus.parse(hub(peers = listOf(peer(media = """{"playback":"buffering","app":"","title":"","artist":""}"""))))
     }
 
     @Test

@@ -2,7 +2,7 @@
 //! to core types.
 
 use audiobridge_core::proto::MAX_LEVEL;
-use audiobridge_core::session::PcRequest;
+use audiobridge_core::session::{MediaCommand, PcRequest};
 
 // `controlPc` actions; keep in sync with the `NativeBridge.PC_*` constants.
 pub const PC_AUDIO: i32 = 0;
@@ -10,9 +10,11 @@ pub const PC_MIC: i32 = 1;
 pub const PC_MIC_DEFAULT: i32 = 2;
 pub const PC_VOLUME: i32 = 3;
 pub const PC_MUTE: i32 = 4;
+/// `value` is a media command code (`NativeBridge.MEDIA_*` = [`MediaCommand::code`]).
+pub const PC_MEDIA: i32 = 5;
 
 /// `controlPc(peerId, action, value)`: switches are on for any non-zero `value`, the volume is clamped to
-/// `0..=100`. `None` for an unknown action.
+/// `0..=100`. `None` for an unknown action or media command.
 pub fn pc_request(action: i32, value: i32) -> Option<PcRequest> {
     let on = value != 0;
     Some(match action {
@@ -21,6 +23,7 @@ pub fn pc_request(action: i32, value: i32) -> Option<PcRequest> {
         PC_MIC_DEFAULT => PcRequest::MicDefault(on),
         PC_VOLUME => PcRequest::Volume(clamp_level(value)),
         PC_MUTE => PcRequest::Mute(on),
+        PC_MEDIA => PcRequest::Media(MediaCommand::from_code(u8::try_from(value).ok()?)?),
         _ => return None,
     })
 }
@@ -68,8 +71,26 @@ mod tests {
 
     #[test]
     fn unknown_action_is_none() {
-        for action in [-1, 5, i32::MIN, i32::MAX] {
+        for action in [-1, 6, i32::MIN, i32::MAX] {
             assert_eq!(pc_request(action, 1), None, "action {action}");
+        }
+    }
+
+    #[test]
+    fn media_actions_map_to_commands() {
+        // the Kotlin side sends NativeBridge.MEDIA_PLAY..MEDIA_PREVIOUS = 0..4
+        let cases = [
+            (0, MediaCommand::Play),
+            (1, MediaCommand::Pause),
+            (2, MediaCommand::PlayPause),
+            (3, MediaCommand::Next),
+            (4, MediaCommand::Previous),
+        ];
+        for (value, cmd) in cases {
+            assert_eq!(pc_request(PC_MEDIA, value), Some(PcRequest::Media(cmd)), "value {value}");
+        }
+        for value in [-1, 5, 256, i32::MAX] {
+            assert_eq!(pc_request(PC_MEDIA, value), None, "value {value}");
         }
     }
 

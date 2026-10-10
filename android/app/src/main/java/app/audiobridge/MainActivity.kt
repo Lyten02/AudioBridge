@@ -81,6 +81,10 @@ class MainActivity : ComponentActivity() {
                 val micForeground by StatusHub.micForeground.collectAsStateWithLifecycle()
                 val micEnabled by prefs.micEnabled.collectAsStateWithLifecycle()
                 val autostartDone by prefs.autostartDone.collectAsStateWithLifecycle()
+                val headset by prefs.headset.collectAsStateWithLifecycle()
+                val headsetTarget by StatusHub.mediaTargetId.collectAsStateWithLifecycle()
+                val lastMediaKey by StatusHub.lastMediaKey.collectAsStateWithLifecycle()
+                val serviceEnabled by prefs.serviceEnabled.collectAsStateWithLifecycle()
                 val version = systemStateVersion.intValue
 
                 val micPermission = remember(version) { hasPermission(Manifest.permission.RECORD_AUDIO) }
@@ -102,6 +106,13 @@ class MainActivity : ComponentActivity() {
                     onMuteAll = ::setAllMuted,
                     onMicToggle = ::setMic,
                     onPcControl = ::controlPc,
+                    headset = headset,
+                    headsetTargetId = headsetTarget,
+                    lastMediaKey = lastMediaKey,
+                    // The service observes the settings and applies them right away.
+                    onHeadsetChange = prefs::setHeadset,
+                    serviceEnabled = serviceEnabled,
+                    onServiceToggle = ::setServiceEnabled,
                 )
             }
         }
@@ -166,7 +177,7 @@ class MainActivity : ComponentActivity() {
 
     private fun removePc(id: String) {
         prefs.removePc(id)
-        if (prefs.pcs.value.isEmpty()) BridgeService.stop(this) else startBridge()
+        if (!prefs.shouldRun()) BridgeService.stop(this) else startBridge()
     }
 
     private fun setPcMuted(id: String, muted: Boolean) {
@@ -179,14 +190,23 @@ class MainActivity : ComponentActivity() {
         startBridge()
     }
 
-    /** (Re)starts the service so it picks up the current PC list and, being visible, may add the mic FGS type. */
+    /**
+     * (Re)starts the service so it picks up the current PC list and, being visible, may add the mic FGS type. Does
+     * nothing while the user has switched AudioBridge off or no PC is paired.
+     */
     private fun startBridge() {
-        if (prefs.pcs.value.isEmpty()) return
+        if (!prefs.shouldRun()) return
         try {
             BridgeService.start(this, fromForeground = true)
         } catch (e: RuntimeException) {
             Log.w(TAG, "could not start bridge service", e)
         }
+    }
+
+    /** The global switch: off really stops the service (connections, audio, notification); pairings stay. */
+    private fun setServiceEnabled(on: Boolean) {
+        prefs.setServiceEnabled(on)
+        if (on) startBridge() else BridgeService.stop(this)
     }
 
     // endregion

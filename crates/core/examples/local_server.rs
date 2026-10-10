@@ -1,17 +1,19 @@
 //! Minimal PC-side server for testing phones/probes without the desktop app.
 //!
 //! ```text
-//! cargo run -p audiobridge-core --example local_server -- [--seconds N] [--sine HZ] [--local] [--mic-demand]
+//! cargo run -p audiobridge-core --example local_server -- [--seconds N] [--sine HZ] [--local] [--mic-demand] [--media]
 //! ```
 //! Prints the pairing URI, streams a sine as "PC audio" while a phone is connected and reports
-//! the RMS of the received microphone every second.
+//! the RMS of the received microphone every second. Every request from the phone is printed
+//! (`REQUEST …`). `--media` also reports a fake media player that follows the phone's media
+//! commands (headphone buttons), so the phone side can be tested without a real PC player.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use audiobridge_core::session::{NetOptions, Server, ServerConfig};
+use audiobridge_core::session::{MediaCommand, NetOptions, PcMedia, PcRequest, Playback, Server, ServerConfig};
 use parking_lot::Mutex;
 
 const BLOCK: usize = 480;
@@ -28,6 +30,7 @@ async fn main() -> Result<()> {
     let mut sine = 1000.0f64;
     let mut opts = NetOptions::default();
     let mut demand = false;
+    let mut media = false;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -35,6 +38,7 @@ async fn main() -> Result<()> {
             "--sine" => sine = it.next().context("--sine HZ")?.parse()?,
             "--local" => opts = NetOptions::local_only(),
             "--mic-demand" => demand = true,
+            "--media" => media = true,
             s => bail!("unknown argument {s}"),
         }
     }
@@ -48,6 +52,17 @@ async fn main() -> Result<()> {
     )
     .await?;
     server.set_mic_demand(demand);
+    let mut requests = server.take_requests().context("requests")?;
+    let fake_media = |playing: bool, track: u32| PcMedia {
+        playback: if playing { Playback::Playing } else { Playback::Paused },
+        app: "Тестовый плеер".into(),
+        title: format!("Трек {track}"),
+        artist: "local_server".into(),
+    };
+    let (mut playing, mut track) = (true, 1u32);
+    if media {
+        server.set_media(fake_media(playing, track));
+    }
     let mut pairing = server.pairing();
     tokio::spawn(async move {
         loop {
@@ -104,15 +119,34 @@ async fn main() -> Result<()> {
     let status = server.status();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.tick().await;
-    for sec in 1..=seconds {
-        tick.tick().await;
-        let s = status.borrow().clone();
-        let (sum, n) = std::mem::take(&mut *mic_level.lock());
-        let rms = if n == 0 { 0.0 } else { (sum / n as f64).sqrt() };
-        println!(
-            "[{sec:>3}s] {:?} peer={:?} path={:?} rtt={:?} | tx {:.0} kbps active={} | mic rms={rms:.3} active={} buf={:.0}ms",
-            s.state, s.peer_name, s.path, s.rtt_ms, s.pc_audio.kbps, s.pc_audio.active, s.mic.active, s.mic.buffer_ms
-        );
+    let mut sec = 0u64;
+    while sec < seconds {
+        tokio::select! {
+            _ = tick.tick() => {
+                sec += 1;
+                let s = status.borrow().clone();
+                let (sum, n) = std::mem::take(&mut *mic_level.lock());
+                let rms = if n == 0 { 0.0 } else { (sum / n as f64).sqrt() };
+                println!(
+                    "[{sec:>3}s] {:?} peer={:?} path={:?} rtt={:?} | tx {:.0} kbps active={} | mic rms={rms:.3} active={} buf={:.0}ms",
+                    s.state, s.peer_name, s.path, s.rtt_ms, s.pc_audio.kbps, s.pc_audio.active, s.mic.active, s.mic.buffer_ms
+                );
+            }
+            Some(req) = requests.recv() => {
+                println!("REQUEST {req:?}");
+                if let (true, PcRequest::Media(cmd)) = (media, req) {
+                    match cmd {
+                        MediaCommand::Play => playing = true,
+                        MediaCommand::Pause => playing = false,
+                        MediaCommand::PlayPause => playing = !playing,
+                        MediaCommand::Next => track += 1,
+                        MediaCommand::Previous => track = track.saturating_sub(1).max(1),
+                    }
+                    println!("MEDIA {} track {track}", if playing { "playing" } else { "paused" });
+                    server.set_media(fake_media(playing, track));
+                }
+            }
+        }
     }
     stop.store(true, Ordering::Relaxed);
     let _ = cap_thread.join();

@@ -29,7 +29,8 @@ object NativeBridge {
 
     /**
      * Remote control of the connected PC [peerId]: [action] is one of the `PC_*` constants, [value] is 0/1 for the
-     * switches and 0..100 for [PC_VOLUME]. Dropped (logged) if that PC is not connected.
+     * switches, 0..100 for [PC_VOLUME] and a `MEDIA_*` command for [PC_MEDIA]. Dropped (logged) if that PC is not
+     * connected.
      */
     external fun controlPc(peerId: String, action: Int, value: Int)
 
@@ -49,4 +50,13 @@ object NativeBridge {
     const val PC_MIC_DEFAULT = 2
     const val PC_VOLUME = 3
     const val PC_MUTE = 4
+    const val PC_MEDIA = 5
+
+    // [PC_MEDIA] commands; keep in sync with `MediaCommand::code` in crates/core/src/proto.rs.
+    const val MEDIA_PLAY = 0
+    const val MEDIA_PAUSE = 1
+    /** Pause if the PC plays, otherwise play (decided by the PC from its real state). */
+    const val MEDIA_PLAY_PAUSE = 2
+    const val MEDIA_NEXT = 3
+    const val MEDIA_PREVIOUS = 4
 }

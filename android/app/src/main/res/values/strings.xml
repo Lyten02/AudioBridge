@@ -82,6 +82,48 @@
     <string name="mic_permission_denied">Без разрешения микрофон не работает</string>
     <string name="open_settings">Настройки</string>
 
+    <!-- Global switch -->
+    <string name="service_on">Включено</string>
+    <string name="service_off">Выключено</string>
+    <string name="service_switch_desc">AudioBridge на телефоне</string>
+    <string name="service_off_title">AudioBridge выключен</string>
+    <string name="service_off_body">Телефон не подключается к компьютерам, звук и микрофон не передаются, фоновой службы и уведомления нет. После перезагрузки AudioBridge тоже не включится сам. Компьютеры (%1$d) и настройки сохранены — компьютеры просто увидят, что телефон не в сети.</string>
+    <string name="service_turn_on">Включить AudioBridge</string>
+
+    <!-- Headphone buttons -->
+    <string name="headset_title">Кнопки наушников управляют ПК</string>
+    <string name="headset_off">Выключено: кнопки работают как обычно на телефоне</string>
+    <string name="headset_no_target">Нет компьютера для управления</string>
+    <string name="headset_no_target_many">Несколько ПК: выберите, каким управлять, или включите музыку на одном</string>
+    <string name="headset_target">Управляют: %1$s</string>
+    <string name="headset_target_media">Управляют: %1$s · %2$s</string>
+    <string name="headset_playing">играет</string>
+    <string name="headset_paused">пауза</string>
+    <string name="headset_media_source">%1$s на %2$s</string>
+    <string name="headset_pc_choice">Какой компьютер</string>
+    <string name="headset_pc_auto">Авто</string>
+    <string name="headset_pc_auto_hint">Авто: тот, где играет музыка; если нигде — последний, которым управляли</string>
+    <string name="headset_default_layout">Два касания — пауза / продолжить, три — предыдущий / следующий трек на ПК. Одно касание меняет громкость телефона, то есть громкость звука ПК в наушниках.</string>
+    <string name="headset_single">Один наушник</string>
+    <string name="headset_single_desc">Одинаковые действия на левом и правом</string>
+    <string name="headset_tap_1">1 касание</string>
+    <string name="headset_tap_2">2 касания</string>
+    <string name="headset_tap_3">3 касания</string>
+    <string name="headset_tap_1_fixed">Громкость, как задано в наушнике</string>
+    <string name="headset_limits">Наушник сам превращает касания в команды и сообщает телефону только «играть / пауза» и «следующий / предыдущий», без числа касаний и стороны. Одно касание он отправляет как громкость: Android меняет громкость телефона, не сообщая приложениям, поэтому его переназначить нельзя. Если ваша модель раскладывает касания иначе, смотрите строку «Последняя команда».</string>
+    <string name="headset_last">Последняя команда: %1$s</string>
+    <string name="headset_last_to">Последняя команда: %1$s → %2$s</string>
+    <string name="headset_last_none">Последняя команда: ещё не было</string>
+    <string name="headset_android_note">Android отдаёт кнопки приложению, которое последним играло звук. Если после музыки на телефоне кнопки снова управляют им, дождитесь звука с ПК в AudioBridge.</string>
+    <string name="tap_play_pause">Пауза / продолжить</string>
+    <string name="tap_next">Следующий трек</string>
+    <string name="tap_previous">Предыдущий трек</string>
+    <string name="tap_volume_up">Громкость +</string>
+    <string name="tap_volume_down">Громкость −</string>
+    <string name="tap_nothing">Ничего</string>
+    <string name="cmd_play">Играть</string>
+    <string name="cmd_pause">Пауза</string>
+
     <!-- Checklist -->
     <string name="setup_title">Чтобы работало в фоне</string>
     <string name="setup_notifications">Уведомления</string>

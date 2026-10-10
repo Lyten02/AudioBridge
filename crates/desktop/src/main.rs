@@ -16,7 +16,9 @@ mod cable_install;
 mod autostart;
 mod icon;
 mod instance;
+mod media;
 mod paths;
+mod service;
 mod settings;
 mod shared;
 mod selfinstall;
@@ -38,9 +40,8 @@ use windows::Win32::System::Threading::GetCurrentProcess;
 use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
 
-use crate::audio::{AudioEngine, Hooks};
 use crate::settings::Settings;
-use crate::shared::{shared, MainCmd};
+use crate::shared::shared;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -114,39 +115,13 @@ fn run(primary: instance::Primary, background: bool, data_dir: &Path) -> Result<
         .enable_all()
         .build()
         .context("tokio runtime")?;
-    let pc_name = paths::computer_name();
-    let server = rt
-        .block_on(Server::start(ServerConfig { data_dir: data_dir.to_path_buf(), pc_name: pc_name.clone() }))
-        .context("сетевой сервер")?;
-    server.set_pc_audio_enabled(settings.pc_audio_enabled);
-    server.set_mic_enabled(settings.mic_enabled);
-    let capture = server.pc_audio_capture();
-    let playout = server.mic_playout();
-    let requests = server.take_requests();
-
     let (main_tx, main_rx) = mpsc::channel();
-    let sh = shared::init(data_dir.to_path_buf(), pc_name, server, settings, main_tx);
-
-    let audio = AudioEngine::spawn(
-        capture,
-        playout,
-        Hooks {
-            on_devices: Box::new(|d| shared().set_devices(d)),
-            on_demand: Box::new(|v| shared().set_mic_demand(v)),
-            on_volume: Box::new(|v| shared().set_pc_volume_state(v)),
-        },
-    )
-    .context("audio thread")?;
-    sh.set_audio_sender(audio.sender());
-    sh.spawn_watchers(&rt, audio.sender());
-    // Remote control from the phone: the server only forwards requests; the app applies them.
-    if let Some(mut requests) = requests {
-        rt.spawn(async move {
-            while let Some(req) = requests.recv().await {
-                shared().apply_request(req);
-            }
-        });
-    }
+    let sh = shared::init(data_dir.to_path_buf(), paths::computer_name(), background, settings, main_tx);
+    let (window_tx, window_rx) = mpsc::channel();
+    let supervisor = std::thread::Builder::new()
+        .name("service-supervisor".into())
+        .spawn(move || service::supervise(rt, main_rx, window_tx))
+        .context("service supervisor thread")?;
     let tray = tray::spawn().context("tray icon")?;
     primary.listen_for_show(|| shared().show_window());
     primary.listen_for_quit(|| shared().request_exit());
@@ -156,26 +131,19 @@ fn run(primary: instance::Primary, background: bool, data_dir: &Path) -> Result<
         trim_working_set();
     }
     while !sh.is_exiting() {
-        match main_rx.recv() {
-            Ok(MainCmd::Show) => {
+        match window_rx.recv() {
+            Ok(()) => {
                 ui::run_window();
                 trim_working_set();
             }
-            Ok(MainCmd::Exit) | Err(_) => break,
+            Err(_) => break,
         }
     }
 
     tracing::info!("shutting down");
+    sh.request_exit();
+    let _ = supervisor.join();
     tray.quit();
-    audio.shutdown();
-    if let Some(server) = sh.take_server() {
-        rt.block_on(async {
-            if tokio::time::timeout(Duration::from_secs(3), server.shutdown()).await.is_err() {
-                tracing::warn!("server shutdown timed out");
-            }
-        });
-    }
-    rt.shutdown_timeout(Duration::from_secs(1));
     Ok(())
 }
 

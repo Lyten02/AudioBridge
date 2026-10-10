@@ -555,7 +555,10 @@ impl Peer {
         self.hub.mic.tx.shared.set_target(self.slot, None, &self.mic_stats);
         *self.remote.lock() = None;
         conn.close(VarInt::from_u32(0), b"bye");
-        self.status.update(clear_connection_status);
+        self.status.update(|s| {
+            clear_connection_status(s);
+            s.media = Default::default();
+        });
         self.refresh_toggles();
         reason
     }
@@ -617,6 +620,11 @@ impl Peer {
                         ControlMsg::SetPhone(req) => {
                             tracing::info!("PC request: {req:?}");
                             let _ = self.hub.requests.send(req);
+                            continue;
+                        }
+                        ControlMsg::PcMedia(media) => {
+                            tracing::debug!("PC media: {:?} '{}'", media.playback, media.app);
+                            self.status.update(|s| s.media = media);
                             continue;
                         }
                         msg => {

@@ -70,10 +70,14 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import app.audiobridge.BridgeStatus
+import app.audiobridge.HeadsetSettings
+import app.audiobridge.MediaKeyLog
 import app.audiobridge.NativeBridge
 import app.audiobridge.PairedPc
 import app.audiobridge.PeerStatus
@@ -122,6 +126,12 @@ fun MainScreen(
     onMicToggle: (Boolean) -> Unit,
     /** Remote control of a connected PC: `NativeBridge.PC_*` action and its value. */
     onPcControl: (pcId: String, action: Int, value: Int) -> Unit,
+    headset: HeadsetSettings,
+    headsetTargetId: String?,
+    lastMediaKey: MediaKeyLog?,
+    onHeadsetChange: (HeadsetSettings) -> Unit,
+    serviceEnabled: Boolean,
+    onServiceToggle: (Boolean) -> Unit,
 ) {
     var removeId by rememberSaveable { mutableStateOf<String?>(null) }
     val rows = pcs.map { PcRow(it, status.peer(it.id)) }
@@ -133,6 +143,22 @@ fun MainScreen(
             TopAppBar(
                 title = { Text(stringResource(R.string.app_name), style = MaterialTheme.typography.titleLarge) },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
+                actions = {
+                    if (rows.isNotEmpty()) {
+                        val desc = stringResource(R.string.service_switch_desc)
+                        Text(
+                            stringResource(if (serviceEnabled) R.string.service_on else R.string.service_off),
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Switch(
+                            checked = serviceEnabled,
+                            onCheckedChange = onServiceToggle,
+                            modifier = Modifier.padding(end = 12.dp).semantics { contentDescription = desc },
+                        )
+                    }
+                },
             )
         },
     ) { padding ->
@@ -146,9 +172,12 @@ fun MainScreen(
         ) {
             if (rows.isEmpty()) {
                 Onboarding(onAddPc)
+            } else if (!serviceEnabled) {
+                ServiceOffCard(pcCount = rows.size, onTurnOn = { onServiceToggle(true) })
             } else {
                 OverviewCard(rows, status, onMuteAll)
                 MicCard(rows, status, mic, onMicToggle)
+                HeadsetCard(headset, pcs, status, headsetTargetId, lastMediaKey, onHeadsetChange)
                 SectionHeader(stringResource(R.string.pcs_title), rows.size)
                 rows.forEach { row ->
                     key(row.pc.id) {
@@ -186,6 +215,28 @@ fun MainScreen(
                 TextButton(onClick = { removeId = null }) { Text(stringResource(R.string.cancel)) }
             },
         )
+    }
+}
+
+/** AudioBridge is switched off: nothing runs, pairings and settings are kept. */
+@Composable
+private fun ServiceOffCard(pcCount: Int, onTurnOn: () -> Unit) {
+    Card(
+        shape = RoundedCornerShape(28.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text(stringResource(R.string.service_off_title), style = MaterialTheme.typography.headlineSmall)
+            Text(
+                stringResource(R.string.service_off_body, pcCount),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Button(onClick = onTurnOn, modifier = Modifier.fillMaxWidth()) {
+                Text(stringResource(R.string.service_turn_on))
+            }
+        }
     }
 }
 

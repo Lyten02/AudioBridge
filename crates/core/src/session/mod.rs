@@ -17,7 +17,9 @@ use crate::audio::tx::TxStats;
 use crate::audio::RxSlot;
 use crate::proto::{ControlMsg, DatagramHeader, PacketKind, StreamId};
 
-pub use crate::proto::{PcControls, PcRequest, PhoneControls, PhoneRequest, Volume};
+pub use crate::proto::{
+    MediaCommand, PcControls, PcMedia, PcRequest, PhoneControls, PhoneRequest, Playback, Volume,
+};
 pub use hub::{Hub, MAX_PEERS};
 pub use server::Server;
 
@@ -71,6 +73,9 @@ pub struct Status {
     /// PC side: the connected phone's last reported controls (`None` without a phone).
     /// Always `None` on the phone side.
     pub phone: Option<PhoneControls>,
+    /// PC side: its own media session. Phone side: what this PC last reported (cleared on
+    /// disconnect).
+    pub media: PcMedia,
     pub last_error: Option<String>,
 }
 
@@ -88,6 +93,7 @@ impl Status {
             mic: StreamStats::default(),
             pc: PcControls::default(),
             phone: None,
+            media: PcMedia::default(),
             last_error: None,
         }
     }

@@ -212,7 +212,8 @@ pub extern "system" fn Java_app_audiobridge_NativeBridge_setVolume<'l>(
 }
 
 /// Remote control of the PC `peerId`: `action` is a `NativeBridge.PC_*` constant, `value` 0/1 for switches and
-/// `0..=100` for the volume (see [`controls::pc_request`]). Dropped (logged) if that PC is not connected.
+/// `0..=100` for the volume, a media command code for `PC_MEDIA` (see [`controls::pc_request`]). Dropped (logged)
+/// if that PC is not connected.
 #[no_mangle]
 pub extern "system" fn Java_app_audiobridge_NativeBridge_controlPc<'l>(
     mut env: JNIEnv<'l>,
@@ -226,7 +227,7 @@ pub extern "system" fn Java_app_audiobridge_NativeBridge_controlPc<'l>(
         let Some(peer_id) = read_string(&mut env, &peer_id) else { return };
         match controls::pc_request(action, value) {
             Some(req) => engine.send(Cmd::ControlPc { peer_id, req }),
-            None => log::warn!("controlPc: unknown action {action}"),
+            None => log::warn!("controlPc: unknown action {action} / value {value}"),
         }
     })
 }
