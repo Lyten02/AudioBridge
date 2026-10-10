@@ -1,20 +1,20 @@
 //! Process-wide state shared by the UI, tray, audio hooks and status watchers.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Mutex, OnceLock};
 
 use audiobridge_core::pairing::PairingInfo;
 use audiobridge_core::proto::MAX_LEVEL;
 use audiobridge_core::session::{ConnState, PcMedia, PcRequest, PhoneRequest, Server, Status, Volume};
-use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     IsIconic, PostMessageW, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
 };
 
-use crate::audio::{set_default_endpoint, AudioMsg, Desired, DeviceSummary};
+use crate::audio::{AudioMsg, Desired, DeviceSummary};
 use crate::cable_install::InstallState;
 use crate::settings::Settings;
 use crate::{autostart, tray};
@@ -22,23 +22,28 @@ use crate::{autostart, tray};
 pub enum MainCmd {
     Show,
     Exit,
+    SetEnabled(bool),
+    DefaultDevice { generation: u64, id: String, what: &'static str },
+    Remote { generation: u64, request: PcRequest },
 }
 
 pub struct Shared {
     pub data_dir: PathBuf,
     pub pc_name: String,
     server: Mutex<Option<Server>>,
-    pub status: watch::Receiver<Status>,
-    pub pairing: watch::Receiver<Option<PairingInfo>>,
+    status: Mutex<Status>,
+    pairing: Mutex<Option<PairingInfo>>,
     settings: Mutex<Settings>,
     devices: Mutex<DeviceSummary>,
     ui_ctx: Mutex<Option<eframe::egui::Context>>,
     window_hwnd: AtomicIsize,
+    window_state: Mutex<WindowState>,
     tray_hwnd: AtomicIsize,
     tray_connected: AtomicBool,
     tray_tip: Mutex<String>,
     main_tx: Sender<MainCmd>,
     exiting: AtomicBool,
+    service_generation: AtomicU64,
     audio_tx: Mutex<Option<Sender<AudioMsg>>>,
     media_tx: Mutex<Option<crate::media::Sender>>,
     cable_install: Mutex<InstallState>,
@@ -54,27 +59,32 @@ pub fn shared() -> &'static Shared {
 pub fn init(
     data_dir: PathBuf,
     pc_name: String,
-    server: Server,
+    background: bool,
     settings: Settings,
     main_tx: Sender<MainCmd>,
 ) -> &'static Shared {
-    let status = server.status();
-    let pairing = server.pairing();
+    let status = stopped_status(&settings);
+    let pairing = std::fs::read_to_string(data_dir.join("pairing.txt"))
+        .ok()
+        .and_then(|uri| PairingInfo::from_uri(&uri).ok());
+    let tip = if settings.service_enabled { "AudioBridge — Запуск…" } else { "AudioBridge — Выключено" };
     let state = Shared {
         data_dir,
         pc_name,
-        server: Mutex::new(Some(server)),
-        status,
-        pairing,
+        server: Mutex::new(None),
+        status: Mutex::new(status),
+        pairing: Mutex::new(pairing),
         settings: Mutex::new(settings),
         devices: Mutex::new(DeviceSummary::default()),
         ui_ctx: Mutex::new(None),
         window_hwnd: AtomicIsize::new(0),
+        window_state: Mutex::new(if background { WindowState::Closed } else { WindowState::Opening }),
         tray_hwnd: AtomicIsize::new(0),
         tray_connected: AtomicBool::new(false),
-        tray_tip: Mutex::new("AudioBridge — Ожидание телефона".to_owned()),
+        tray_tip: Mutex::new(tip.to_owned()),
         main_tx,
         exiting: AtomicBool::new(false),
+        service_generation: AtomicU64::new(0),
         audio_tx: Mutex::new(None),
         media_tx: Mutex::new(None),
         cable_install: Mutex::new(InstallState::Idle),
@@ -89,6 +99,42 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+
+/// Coalesce requests before native window creation; never queue another window behind an open one.
+#[derive(Debug, PartialEq, Eq)]
+enum WindowState {
+    Closed,
+    Opening,
+    Open,
+}
+
+impl WindowState {
+    fn request_open(&mut self) -> bool {
+        if *self != Self::Closed {
+            return false;
+        }
+        *self = Self::Opening;
+        true
+    }
+}
+
+fn stopped_status(settings: &Settings) -> Status {
+    Status {
+        state: ConnState::Stopped,
+        peer_name: None,
+        path: None,
+        rtt_ms: None,
+        pc_audio_enabled: settings.pc_audio_enabled,
+        mic_enabled: settings.mic_enabled,
+        mic_demanded: false,
+        pc_audio: Default::default(),
+        mic: Default::default(),
+        pc: Default::default(),
+        phone: None,
+        media: Default::default(),
+        last_error: None,
+    }
+}
 impl Shared {
     fn with_server(&self, f: impl FnOnce(&Server)) {
         if let Some(s) = lock(&self.server).as_ref() {
@@ -100,17 +146,67 @@ impl Shared {
         lock(&self.server).take()
     }
 
+    pub fn install_server(&self, server: Server) {
+        *lock(&self.status) = server.status().borrow().clone();
+        *lock(&self.server) = Some(server);
+    }
+
+    pub fn status(&self) -> Status {
+        lock(&self.status).clone()
+    }
+
+    pub fn pairing_uri(&self) -> Option<String> {
+        lock(&self.pairing).as_ref().map(PairingInfo::to_uri)
+    }
+
+    pub fn set_enabled(&self, enabled: bool) {
+        let _ = self.main_tx.send(MainCmd::SetEnabled(enabled));
+    }
+
+    pub fn persist_enabled(&self, enabled: bool) {
+        self.update_settings(|s| s.service_enabled = enabled);
+        self.refresh_tray();
+    }
+
+    pub fn remember_mic_default(&self, enabled: bool) {
+        self.update_settings(|s| s.resume_mic_default = enabled);
+    }
+
+    pub fn service_stopped(&self, error: Option<String>) {
+        let mut status = stopped_status(&self.settings());
+        status.last_error = error;
+        *lock(&self.status) = status;
+        *lock(&self.audio_tx) = None;
+        *lock(&self.media_tx) = None;
+        self.update_tray(false, "AudioBridge — Выключено".into());
+        self.repaint();
+    }
+
+    pub fn set_generation(&self, generation: u64) {
+        self.service_generation.store(generation, Ordering::SeqCst);
+    }
+
+    fn refresh_tray(&self) {
+        let hwnd = self.tray_hwnd.load(Ordering::SeqCst);
+        if hwnd != 0 {
+            // SAFETY: posting a refresh to our own tray window.
+            unsafe {
+                let _ = PostMessageW(Some(HWND(hwnd as *mut _)), tray::WM_TRAY_REFRESH, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
+
     pub fn settings(&self) -> Settings {
         lock(&self.settings).clone()
     }
 
     fn update_settings(&self, f: impl FnOnce(&mut Settings)) {
-        let snapshot = {
+        {
             let mut s = lock(&self.settings);
             f(&mut s);
-            s.clone()
-        };
-        snapshot.save(&self.data_dir);
+            // Serialize mutation and tmp+rename with every other settings writer.
+            s.save(&self.data_dir);
+        }
         self.repaint();
     }
 
@@ -120,7 +216,7 @@ impl Shared {
         self.with_server(|s| s.set_pc_audio_enabled(on));
         self.update_settings(|s| s.pc_audio_enabled = on);
         let d = self.devices();
-        if on && d.default_is_cable {
+        if on && self.settings().service_enabled && d.default_is_cable {
             let remembered = self.settings().last_default_render;
             match d.render_restore_candidate(remembered.as_deref()) {
                 Some(target) => self.restore_default_render(target.id.clone()),
@@ -137,12 +233,14 @@ impl Shared {
         self.with_server(|s| s.set_mic_enabled(on));
         self.update_settings(|s| s.mic_enabled = on);
         if on {
-            let phone = self.status.borrow().phone;
+            let phone = self.status().phone;
             if phone.is_some_and(|p| !p.mic) {
                 self.set_phone_mic(true);
             }
         }
-        self.set_mic_default(on);
+        if self.settings().service_enabled {
+            self.set_mic_default(on);
+        }
     }
 
     /// Makes the virtual mic ("CABLE Output") the Windows default recording device, or restores
@@ -291,19 +389,10 @@ impl Shared {
         self.switch_default_device(id, "playback");
     }
 
-    /// Makes `id` the default device of its direction (`what`: "playback"/"recording", for logs)
-    /// on a helper thread, since the COM calls can block, then re-reads the device list.
+    /// Makes `id` the default device on the service supervisor, serialized with service shutdown.
     fn switch_default_device(&'static self, id: String, what: &'static str) {
-        let spawned = std::thread::Builder::new().name("set-default-device".into()).spawn(move || {
-            match set_default_endpoint(&id) {
-                Ok(()) => tracing::info!("default {what} device set to {id}"),
-                Err(e) => tracing::warn!("setting the default {what} device failed: {e:#}"),
-            }
-            self.rescan_devices();
-        });
-        if let Err(e) = spawned {
-            tracing::warn!("set-default-device thread: {e}");
-        }
+        let generation = self.service_generation.load(Ordering::SeqCst);
+        let _ = self.main_tx.send(MainCmd::DefaultDevice { generation, id, what });
     }
 
     pub fn cable_install_state(&self) -> InstallState {
@@ -320,11 +409,13 @@ impl Shared {
     pub fn register_window(&self, hwnd: isize, ctx: eframe::egui::Context) {
         *lock(&self.ui_ctx) = Some(ctx);
         self.window_hwnd.store(hwnd, Ordering::SeqCst);
+        *lock(&self.window_state) = WindowState::Open;
     }
 
     pub fn unregister_window(&self) {
         self.window_hwnd.store(0, Ordering::SeqCst);
         *lock(&self.ui_ctx) = None;
+        *lock(&self.window_state) = WindowState::Closed;
     }
 
     /// Requests a repaint only while the window exists; costs nothing otherwise.
@@ -345,7 +436,7 @@ impl Shared {
                 let _ = SetForegroundWindow(hwnd);
             }
             self.repaint();
-        } else if !self.is_exiting() {
+        } else if !self.is_exiting() && lock(&self.window_state).request_open() {
             let _ = self.main_tx.send(MainCmd::Show);
         }
     }
@@ -395,14 +486,24 @@ impl Shared {
     // ---- watchers ---------------------------------------------------------------------------
 
     /// Mirrors status changes into the audio engine, tray and UI. Runs on the tokio runtime.
-    pub fn spawn_watchers(&'static self, rt: &tokio::runtime::Runtime, audio: Sender<AudioMsg>) {
-        let mut status = self.status.clone();
-        rt.spawn(async move {
+    pub fn spawn_watchers(
+        &'static self,
+        rt: &tokio::runtime::Runtime,
+        audio: Sender<AudioMsg>,
+        generation: u64,
+    ) -> Vec<JoinHandle<()>> {
+        let server = lock(&self.server);
+        let server = server.as_ref().expect("service installed before watchers");
+        let mut status = server.status();
+        let mut pairing = server.pairing();
+        let mut requests = server.take_requests().expect("one request reader per service");
+        let status_task = rt.spawn(async move {
             let mut last = None;
             let mut mic_glitches = (0u64, 0u64);
             loop {
                 let (desired, connected, tip) = {
                     let s = status.borrow_and_update();
+                    *lock(&self.status) = s.clone();
                     let connected = s.state == ConnState::Connected;
                     let desired = Desired {
                         connected,
@@ -441,14 +542,20 @@ impl Shared {
                 }
             }
         });
-        let mut pairing = self.pairing.clone();
         let path = self.data_dir.join("pairing.txt");
-        rt.spawn(async move {
+        let pairing_task = rt.spawn(async move {
             loop {
-                let uri = pairing.borrow_and_update().as_ref().map(PairingInfo::to_uri);
-                if let Some(uri) = uri {
-                    if let Err(e) = std::fs::write(&path, &uri) {
-                        tracing::warn!("cannot write {}: {e}", path.display());
+                // Keep the published QR stable across off/on and application restarts.
+                let info = pairing.borrow_and_update().clone();
+                {
+                    let mut cached = lock(&self.pairing);
+                    if let (None, Some(info)) = (&*cached, info) {
+                        let uri = info.to_uri();
+                        let tmp = path.with_extension("txt.tmp");
+                        if let Err(e) = std::fs::write(&tmp, &uri).and_then(|()| std::fs::rename(&tmp, &path)) {
+                            tracing::warn!("cannot write {}: {e}", path.display());
+                        }
+                        *cached = Some(info);
                     }
                 }
                 self.repaint();
@@ -457,5 +564,38 @@ impl Shared {
                 }
             }
         });
+        let requests_task = rt.spawn(async move {
+            while let Some(request) = requests.recv().await {
+                if self.main_tx.send(MainCmd::Remote { generation, request }).is_err() {
+                    break;
+                }
+            }
+        });
+        vec![status_task, pairing_task, requests_task]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WindowState;
+
+    #[test]
+    fn repeated_tray_events_open_only_one_window() {
+        let mut state = WindowState::Closed;
+        assert!(state.request_open());
+        // WM_LBUTTONUP, WM_LBUTTONDBLCLK and the second UP may precede registration.
+        assert!(!state.request_open());
+        assert!(!state.request_open());
+        state = WindowState::Open;
+        assert!(!state.request_open());
+        state = WindowState::Closed;
+        // Only a new explicit request can open it after X.
+        assert!(state.request_open());
+    }
+
+    #[test]
+    fn foreground_start_coalesces_show_during_creation() {
+        let mut state = WindowState::Opening;
+        assert!(!state.request_open());
     }
 }

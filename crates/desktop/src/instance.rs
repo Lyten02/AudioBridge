@@ -1,16 +1,24 @@
 //! Single instance: a named mutex plus a named auto-reset event the primary waits on.
 //! A second launch signals the event (after granting foreground rights) and exits.
 
-use windows::core::{w, PCWSTR};
+use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
 use windows::Win32::System::Threading::{
     CreateEventW, CreateMutexW, OpenEventW, SetEvent, WaitForSingleObject, EVENT_MODIFY_STATE, INFINITE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{AllowSetForegroundWindow, ASFW_ANY};
 
-const MUTEX_NAME: PCWSTR = w!("Local\\AudioBridge.Instance");
-const SHOW_EVENT_NAME: PCWSTR = w!("Local\\AudioBridge.Show");
-const QUIT_EVENT_NAME: PCWSTR = w!("Local\\AudioBridge.Quit");
+fn object_name(kind: &str) -> HSTRING {
+    #[cfg(debug_assertions)]
+    if let Some(dir) = crate::paths::dev_dir() {
+        use std::hash::{Hash, Hasher};
+        let canonical = std::fs::canonicalize(&dir).unwrap_or(dir);
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        canonical.to_string_lossy().to_lowercase().hash(&mut hash);
+        return HSTRING::from(format!("Local\\AudioBridge.Dev.{:016x}.{kind}", hash.finish()));
+    }
+    HSTRING::from(format!("Local\\AudioBridge.{kind}"))
+}
 
 /// An owned kernel handle that may be moved across threads.
 pub struct OwnedHandle(pub HANDLE);
@@ -36,14 +44,14 @@ pub struct Primary {
 
 /// Returns `Some(Primary)` if this is the only instance, `None` if another one runs.
 pub fn acquire() -> anyhow::Result<Option<Primary>> {
-    // SAFETY: plain kernel object creation with static names.
+    // SAFETY: plain kernel object creation with names valid for each call.
     unsafe {
-        let mutex = OwnedHandle(CreateMutexW(None, false, MUTEX_NAME)?);
+        let mutex = OwnedHandle(CreateMutexW(None, false, &object_name("Instance"))?);
         if GetLastError() == ERROR_ALREADY_EXISTS {
             return Ok(None);
         }
-        let show_event = OwnedHandle(CreateEventW(None, false, false, SHOW_EVENT_NAME)?);
-        let quit_event = OwnedHandle(CreateEventW(None, false, false, QUIT_EVENT_NAME)?);
+        let show_event = OwnedHandle(CreateEventW(None, false, false, &object_name("Show"))?);
+        let quit_event = OwnedHandle(CreateEventW(None, false, false, &object_name("Quit"))?);
         Ok(Some(Primary { _mutex: mutex, show_event, quit_event }))
     }
 }
@@ -52,7 +60,7 @@ pub fn acquire() -> anyhow::Result<Option<Primary>> {
 pub fn another_running() -> bool {
     // SAFETY: as in `acquire`; the handle is closed right away.
     unsafe {
-        match CreateMutexW(None, false, MUTEX_NAME) {
+        match CreateMutexW(None, false, &object_name("Instance")) {
             Ok(h) => {
                 let exists = GetLastError() == ERROR_ALREADY_EXISTS;
                 let _ = CloseHandle(h);
@@ -79,12 +87,12 @@ pub fn signal_existing() {
     unsafe {
         let _ = AllowSetForegroundWindow(ASFW_ANY);
     }
-    signal(SHOW_EVENT_NAME);
+    signal(PCWSTR(object_name("Show").as_ptr()));
 }
 
 /// Asks the running instance to exit (used before replacing its exe).
 pub fn signal_quit() {
-    signal(QUIT_EVENT_NAME);
+    signal(PCWSTR(object_name("Quit").as_ptr()));
 }
 
 fn listen(name: &str, event: &OwnedHandle, on_fire: impl Fn() + Send + 'static) {

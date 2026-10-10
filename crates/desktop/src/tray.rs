@@ -18,7 +18,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
     DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, PostMessageW, PostQuitMessage,
     RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, SetMenuDefaultItem, TrackPopupMenu,
-    TranslateMessage, HICON, ICONINFO, MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, SM_CXSMICON,
+    TranslateMessage, HICON, ICONINFO, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, SM_CXSMICON,
     TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WM_APP, WM_CONTEXTMENU, WM_DESTROY,
     WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
 };
@@ -35,10 +35,12 @@ const ID_OPEN: usize = 1;
 const ID_PC: usize = 2;
 const ID_MIC: usize = 3;
 const ID_EXIT: usize = 4;
+const ID_ENABLED: usize = 5;
 
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 static ICON_ON: AtomicIsize = AtomicIsize::new(0);
 static ICON_OFF: AtomicIsize = AtomicIsize::new(0);
+static ICON_DISABLED: AtomicIsize = AtomicIsize::new(0);
 
 pub struct Tray {
     hwnd: isize,
@@ -72,8 +74,9 @@ pub fn spawn() -> Result<Tray> {
         // SAFETY: creating icons and adding the notification icon for our own window.
         unsafe {
             let size = GetSystemMetrics(SM_CXSMICON).max(16) as u32;
-            ICON_ON.store(make_icon(size, true).map_or(0, |h| h.0 as isize), Ordering::SeqCst);
-            ICON_OFF.store(make_icon(size, false).map_or(0, |h| h.0 as isize), Ordering::SeqCst);
+            ICON_ON.store(make_icon(size, true, false).map_or(0, |h| h.0 as isize), Ordering::SeqCst);
+            ICON_OFF.store(make_icon(size, false, false).map_or(0, |h| h.0 as isize), Ordering::SeqCst);
+            ICON_DISABLED.store(make_icon(size, false, true).map_or(0, |h| h.0 as isize), Ordering::SeqCst);
             notify(hwnd, NIM_ADD);
         }
         let _ = tx.send(Ok(hwnd.0 as isize));
@@ -84,7 +87,7 @@ pub fn spawn() -> Result<Tray> {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
-            for icon in [&ICON_ON, &ICON_OFF] {
+            for icon in [&ICON_ON, &ICON_OFF, &ICON_DISABLED] {
                 let h = icon.swap(0, Ordering::SeqCst);
                 if h != 0 {
                     let _ = DestroyIcon(HICON(h as *mut _));
@@ -130,8 +133,14 @@ unsafe fn create_window() -> Result<HWND> {
 }
 
 /// Builds an HICON from the code-drawn RGBA image.
-unsafe fn make_icon(size: u32, connected: bool) -> Result<HICON> {
-    let rgba = icon::render(size, connected);
+unsafe fn make_icon(size: u32, connected: bool, disabled: bool) -> Result<HICON> {
+    let mut rgba = icon::render(size, connected);
+    if disabled {
+        for pixel in rgba.chunks_exact_mut(4) {
+            let grey = ((u16::from(pixel[0]) + u16::from(pixel[1]) + u16::from(pixel[2])) / 3) as u8;
+            pixel[..3].fill(grey);
+        }
+    }
     unsafe {
         let bmi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
@@ -174,7 +183,13 @@ fn copy_wide(dst: &mut [u16], s: &str) {
 
 unsafe fn notify(hwnd: HWND, op: windows::Win32::UI::Shell::NOTIFY_ICON_MESSAGE) {
     let (connected, tip) = shared().tray_state();
-    let icon = if connected { &ICON_ON } else { &ICON_OFF };
+    let icon = if !shared().settings().service_enabled {
+        &ICON_DISABLED
+    } else if connected {
+        &ICON_ON
+    } else {
+        &ICON_OFF
+    };
     let mut data = NOTIFYICONDATAW {
         cbSize: size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
@@ -197,9 +212,12 @@ unsafe fn show_menu(hwnd: HWND) {
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
         let _ = AppendMenuW(menu, MF_STRING, ID_OPEN, w!("Открыть"));
+        let label = if s.service_enabled { w!("Выключить AudioBridge") } else { w!("Включить AudioBridge") };
+        let _ = AppendMenuW(menu, MF_STRING, ID_ENABLED, label);
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(menu, MF_STRING | check(s.pc_audio_enabled), ID_PC, w!("Звук компьютера"));
-        let _ = AppendMenuW(menu, MF_STRING | check(s.mic_enabled), ID_MIC, w!("Микрофон"));
+        let disabled = if s.service_enabled { MF_STRING } else { MF_STRING | MF_GRAYED };
+        let _ = AppendMenuW(menu, disabled | check(s.pc_audio_enabled), ID_PC, w!("Звук компьютера"));
+        let _ = AppendMenuW(menu, disabled | check(s.mic_enabled), ID_MIC, w!("Микрофон"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, w!("Выход"));
         let _ = SetMenuDefaultItem(menu, ID_OPEN as u32, 0);
@@ -212,6 +230,7 @@ unsafe fn show_menu(hwnd: HWND) {
         let _ = DestroyMenu(menu);
         match cmd.0 as usize {
             ID_OPEN => shared().show_window(),
+            ID_ENABLED => shared().set_enabled(!s.service_enabled),
             ID_PC => shared().set_pc_audio(!s.pc_audio_enabled),
             ID_MIC => shared().set_mic(!s.mic_enabled),
             ID_EXIT => shared().request_exit(),

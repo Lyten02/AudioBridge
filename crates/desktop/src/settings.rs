@@ -8,8 +8,12 @@ use serde::{Deserialize, Serialize};
 #[serde(default)]
 pub struct Settings {
     pub autostart: bool,
+    /// Global service switch. Missing in older files means enabled.
+    pub service_enabled: bool,
     pub pc_audio_enabled: bool,
     pub mic_enabled: bool,
+    /// Restore the pre-off recording route, independently of accepting the phone microphone.
+    pub resume_mic_default: bool,
     /// Endpoint id of the last default playback device that was not VB-CABLE, so a CABLE
     /// hijack of the default device (common right after installing VB-CABLE) can be undone.
     pub last_default_render: Option<String>,
@@ -22,8 +26,10 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             autostart: true,
+            service_enabled: true,
             pc_audio_enabled: true,
             mic_enabled: true,
+            resume_mic_default: false,
             last_default_render: None,
             last_default_capture: None,
         }
@@ -59,5 +65,24 @@ impl Settings {
         if let Err(e) = result {
             tracing::warn!("failed to save {}: {e}", path.display());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Settings;
+
+    #[test]
+    fn old_settings_keep_service_enabled() {
+        let settings: Settings = serde_json::from_str(r#"{"mic_enabled":false}"#).unwrap();
+        assert!(settings.service_enabled);
+        assert!(!settings.mic_enabled);
+    }
+
+    #[test]
+    fn disabled_service_roundtrips_without_changing_features() {
+        let settings = Settings { service_enabled: false, mic_enabled: false, ..Settings::default() };
+        let json = serde_json::to_vec(&settings).unwrap();
+        assert_eq!(serde_json::from_slice::<Settings>(&json).unwrap(), settings);
     }
 }

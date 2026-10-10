@@ -32,6 +32,7 @@ PC (Server)  WASAPI render "CABLE Input" ◄─ PlayoutHandle (jitter buffer, de
 - **Phone-side mute:** `Hub::set_muted(ids)` (Kotlin `NativeBridge.setMuted`, persisted as `muted` per entry in `paired_pcs`). A muted PC stays connected, keeps the mic and keeps streaming. Its feeder still tracks activity but stops queueing audio, so a closed (unread) output never builds a stale backlog; one Silence marker ends the stream, and the mixer ramps it out over 10 ms. Unmuting resets the feeder: fresh stream, no replayed audio. A muted PC doesn't count toward `pc_audio_active`, so the output closes and the wake locks are released, and it gets no Pace packets. It's local to the phone: no wire/protocol change, so it works with any PC version.
 - **Status:** `tokio::sync::watch` (`Status` / `HubStatus`) via `StatusCell::update` → `send_if_modified`. Stats refresh at 2 Hz with change thresholds, so only real changes wake watchers. Keep this "notify on change" pattern; don't add polling.
 - **Desktop audio supervisor:**
+  - `service.rs` owns the service lifetime on `service-supervisor`, independently of the blocking UI loop. Global `settings.json.service_enabled` defaults to true for old files; off joins audio/media workers, cancels and joins relays, shuts down the server endpoint and restores non-CABLE default devices. Restart uses the same identity directory and cached pairing QR. Generation-tagged remote/device commands cannot leak across restart.
   - Loopback runs only when `connected && pc_audio_enabled` and the default device is not a VB-CABLE device.
   - Mic render runs only while `mic.active`.
   - Mic demand comes from `audio/demand.rs`: another process holding an active capture session on "CABLE Output".
@@ -47,6 +48,7 @@ PC (Server)  WASAPI render "CABLE Input" ◄─ PlayoutHandle (jitter buffer, de
   - `audio/`: WASAPI loopback/render, devices, demand, `policy.rs` (IPolicyConfig default-device restore).
   - `ui.rs` (eframe), `tray.rs`, `selfinstall.rs`, `autostart.rs`, `instance.rs`, `cable_install.rs`.
   - The window uses the brand gradient (indigo `#5B4BFF` → teal `#19C3D0`, the same as the Android launcher icon) and draws its icons with the painter. It repaints on status changes; the only timer (`request_repaint_after`, 40 ms) drives the level bars while PC audio streams and the window is open. Child widgets placed at an absolute rect use `ui.new_child(..)`: `scope_builder` moves the parent cursor and makes later cards overlap.
+  - Close destroys the window, not the service. `WindowState` coalesces show requests while creation is pending; tray UP/DBLCLK/UP must not enqueue multiple windows that open after successive closes. Status repaint never opens a window.
 - `crates/android-native/src/`
   - Pure, host-testable: `status.rs` (statusJson v2 + `NotifyGate`), `controls.rs` (`controlPc` actions), `policy.rs`, `peers.rs`.
   - `android/` (cfg android only): `jni_api.rs`, `engine.rs` (tokio + Hub manager), `controller.rs` (`ab-audio` thread), `aaudio.rs`, `listener.rs`, `logging.rs`.
@@ -66,6 +68,7 @@ powershell -File scripts\install-desktop.ps1 [-SkipBuild] [-NoFirewall]
 cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs build --release -p audiobridge-android
 cargo ndk -t arm64-v8a clippy -p audiobridge-android --all-targets -- -D warnings   # Android clippy needs cargo-ndk (cc needs NDK clang)
 ```
+- Debug-only isolation: `AUDIOBRIDGE_DEV_DIR=<absolute temp directory>` gives a separate identity, logs and instance mutex/events; seed `settings.json` with `"autostart": false` before testing beside the installed app. Release builds ignore this variable.
 - **APK:** run Gradle from inside `android/` (PowerShell: `Set-Location android; .\gradlew.bat :app:assembleDebug`). It runs `buildRustLib` (cargo-ndk) automatically; add `-PskipRust` to reuse the `.so` already in `jniLibs`. Also: `:app:testDebugUnitTest`, `:app:lintDebug`.
 - **Manual E2E without a phone or PC:**
   - Phone emulator against a running PC app: `cargo run -p audiobridge-core --example probe -- <pairing-uri> [--seconds N] [--mic-sine HZ] [--local]`.
@@ -92,7 +95,8 @@ cargo ndk -t arm64-v8a clippy -p audiobridge-android --all-targets -- -D warning
   - Persisted headset settings keys and `TapAction.pref` values (`AppState.kt`, `MediaKeys.kt`): never rename.
 - **Persisted state:**
   - PC: `%APPDATA%\AudioBridge` holds `server.key`, `pairing.secret`, `server.port`, `settings.json` and `pairing.txt`. Writes go through tmp+rename; corrupt files are regenerated. Changing `server.key` or `pairing.secret` breaks every existing pairing.
-  - Phone: `<filesDir>/audiobridge/client.key`, plus SharedPreferences `audiobridge` (`paired_pcs` JSON list of `{id, name, uri, muted}`, `mic_enabled` (also flipped remotely by a PC), `autostart_done`, headphone buttons: `headset_enabled`, `headset_single_earbud`, `headset_double_tap`, `headset_triple_tap`, `headset_target`).
+  - Phone: `<filesDir>/audiobridge/client.key`, plus SharedPreferences `audiobridge` (`paired_pcs` JSON list of `{id, name, uri, muted}`, `mic_enabled` (also flipped remotely by a PC), `autostart_done`, `service_enabled` (the global switch, missing = on), headphone buttons: `headset_enabled`, `headset_single_earbud`, `headset_double_tap`, `headset_triple_tap`, `headset_target`).
+- **Global switch (phone):** `Prefs.serviceEnabled` (written with `commit`). Off stops `BridgeService` (native `setPeers("[]")` → hub stopped, no notification, no media session); every start path (`MainActivity.startBridge`, `BootReceiver`, a sticky restart in `onStartCommand`) checks `Prefs.shouldRun()`. Pairings and settings stay. It never tells PCs to switch off: they just see the phone offline.
 - **Default UDP port:** 47130, falling back to a random port.
 - **Screenshots and releases:** the pairing QR contains the PC's secret. Never publish it; promo shots replace it with a QR of the repo URL. GitHub Releases ship `AudioBridge.exe` (the release build) and `AudioBridge.apk` (the debug-signed APK from this machine's `~/.android/debug.keystore`; a different key can't update an installed app).
 
@@ -136,7 +140,7 @@ cargo ndk -t arm64-v8a clippy -p audiobridge-android --all-targets -- -D warning
   - **On-device glitch check:** the phone logs `pc audio glitch: … underruns=… lost=…` and the PC logs `mic glitch: …` whenever counters grow. Compare screen-on vs screen-off with music playing.
   - android-native: host tests for the statusJson v2 schema, `NotifyGate` debounce, `controlPc` mapping, policies and peer parsing.
   - Android: JVM tests `BridgeStatusTest`, `PairedPcTest` and `MediaKeysTest` (key mapping incl. single-earbud, one press = one command, target choice, settings persistence) (`isReturnDefaultValues = false`); there is no instrumented test.
-  - Desktop: a single resampler test.
+  - Desktop: resampler, persisted service default/roundtrip, show-request coalescing, and service-generation request gating tests.
 - **What's not tested:** WASAPI, AAudio, JNI, the UI and the service. Verify those on real hardware:
   - PC audio: play a tone on the PC → the phone UI shows "Звук" / buffer.
   - Mic: `ffmpeg -f dshow -i audio="CABLE Output (VB-Audio Virtual Cable)" -t 8 -af volumedetect -f null -` should report non-silent levels while the phone mic is allowed.

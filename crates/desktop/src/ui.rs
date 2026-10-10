@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use audiobridge_core::pairing::PairingInfo;
 use audiobridge_core::session::{ConnState, PathKind, Status};
 use eframe::egui::{
     self, pos2, vec2, Align, Align2, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Layout,
@@ -395,8 +394,8 @@ impl eframe::App for UiApp {
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let sh = shared();
-        let status = sh.status.borrow().clone();
-        let pairing = sh.pairing.borrow().as_ref().map(PairingInfo::to_uri);
+        let status = sh.status();
+        let pairing = sh.pairing_uri();
         let settings = sh.settings();
         let devices = sh.devices();
         let connected = status.state == ConnState::Connected;
@@ -412,11 +411,23 @@ impl eframe::App for UiApp {
         egui::Frame::new().inner_margin(Margin::same(PAD as i8)).show(ui, |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = GAP;
-                hero(ui, &status, live);
-                warnings(ui, &devices, &settings);
-                if !connected || self.show_qr {
+                hero(ui, &status, live, settings.service_enabled);
+                let label = if settings.service_enabled { "Выключить AudioBridge" } else { "Включить AudioBridge" };
+                if wide_button(ui, label, None) {
+                    sh.set_enabled(!settings.service_enabled);
+                }
+                if !settings.service_enabled {
+                    card(ui, CARD, CARD_STROKE, |ui| {
+                        ui.label("Выключено. Телефон отключён; настройки сохранены.");
+                        if let Some(error) = &status.last_error {
+                            ui.colored_label(RED, error);
+                        }
+                    });
+                } else if !connected || self.show_qr {
+                    warnings(ui, &devices, &settings);
                     self.qr_card(ui, pairing.as_deref(), connected, &status);
                 } else {
+                    warnings(ui, &devices, &settings);
                     connected_cards(ui, &status, &settings, &devices, &mut self.volume_edit);
                     if wide_button(ui, "Показать QR-код", Some(icon_qr)) {
                         self.show_qr = true;
@@ -434,7 +445,7 @@ impl eframe::App for UiApp {
 }
 
 /// Gradient header: logo, name, connection state and live level bars.
-fn hero(ui: &mut Ui, status: &Status, live: bool) {
+fn hero(ui: &mut Ui, status: &Status, live: bool, enabled: bool) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 104.0), Sense::hover());
     let p = ui.painter();
     gradient_rect(p, rect, 20.0, INDIGO, TEAL);
@@ -445,7 +456,7 @@ fn hero(ui: &mut Ui, status: &Status, live: bool) {
 
     let x = logo.right() + 14.0;
     p.text(pos2(x, rect.center().y - 12.0), Align2::LEFT_CENTER, "AudioBridge", semibold(22.0), Color32::WHITE);
-    let (text, color) = status_line(status);
+    let (text, color) = if enabled { status_line(status) } else { ("Выключено".into(), MUTED) };
     let dot = pos2(x + 5.0, rect.center().y + 15.0);
     p.circle_filled(dot, 7.0, Color32::from_black_alpha(60));
     p.circle_filled(dot, 4.0, color);

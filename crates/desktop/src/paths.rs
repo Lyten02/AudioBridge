@@ -16,12 +16,26 @@ fn known_dir(var: &str) -> PathBuf {
 
 /// `%APPDATA%\AudioBridge`: keys, pairing secret, `settings.json`, `pairing.txt`.
 pub fn data_dir() -> PathBuf {
+    #[cfg(debug_assertions)]
+    if let Some(dir) = dev_dir() {
+        return dir;
+    }
     known_dir("APPDATA").join(APP_DIR)
 }
 
 /// `%LOCALAPPDATA%\AudioBridge\logs`.
 pub fn log_dir() -> PathBuf {
+    #[cfg(debug_assertions)]
+    if let Some(dir) = dev_dir() {
+        return dir.join("logs");
+    }
     known_dir("LOCALAPPDATA").join(APP_DIR).join("logs")
+}
+
+/// Isolated debug identity and logs; release builds never inspect this override.
+#[cfg(debug_assertions)]
+pub fn dev_dir() -> Option<PathBuf> {
+    std::env::var_os("AUDIOBRIDGE_DEV_DIR").filter(|v| !v.is_empty()).map(PathBuf::from)
 }
 
 /// The computer's host name as the user set it (e.g. "LYTEN").
