@@ -136,7 +136,7 @@ unsafe fn create_window() -> Result<HWND> {
 unsafe fn make_icon(size: u32, connected: bool, disabled: bool) -> Result<HICON> {
     let mut rgba = icon::render(size, connected);
     if disabled {
-        for pixel in rgba.chunks_exact_mut(4) {
+        for pixel in rgba.as_chunks_mut::<4>().0 {
             let grey = ((u16::from(pixel[0]) + u16::from(pixel[1]) + u16::from(pixel[2])) / 3) as u8;
             pixel[..3].fill(grey);
         }
