@@ -5,7 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.util.Log
 
-/** Restarts the bridge after boot or an app update, if the phone is paired. */
+/** Restarts the bridge after boot or an app update, if the phone is paired and the user has not switched it off. */
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         when (intent.action) {
@@ -15,7 +15,7 @@ class BootReceiver : BroadcastReceiver() {
             -> Unit
             else -> return
         }
-        if (Prefs.get(context).pcs.value.isEmpty()) return
+        if (!Prefs.get(context).shouldRun()) return
         try {
             BridgeService.start(context, fromForeground = false)
         } catch (e: RuntimeException) {

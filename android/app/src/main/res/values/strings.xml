@@ -82,6 +82,14 @@
     <string name="mic_permission_denied">Без разрешения микрофон не работает</string>
     <string name="open_settings">Настройки</string>
 
+    <!-- Global switch -->
+    <string name="service_on">Включено</string>
+    <string name="service_off">Выключено</string>
+    <string name="service_switch_desc">AudioBridge на телефоне</string>
+    <string name="service_off_title">AudioBridge выключен</string>
+    <string name="service_off_body">Телефон не подключается к компьютерам, звук и микрофон не передаются, фоновой службы и уведомления нет. После перезагрузки AudioBridge тоже не включится сам. Компьютеры (%1$d) и настройки сохранены — компьютеры просто увидят, что телефон не в сети.</string>
+    <string name="service_turn_on">Включить AudioBridge</string>
+
     <!-- Headphone buttons -->
     <string name="headset_title">Кнопки наушников управляют ПК</string>
     <string name="headset_off">Выключено: кнопки работают как обычно на телефоне</string>

@@ -23,6 +23,14 @@ class Prefs private constructor(private val sp: SharedPreferences) {
     private val _headset = MutableStateFlow(readHeadset(sp))
     val headset: StateFlow<HeadsetSettings> = _headset.asStateFlow()
 
+    private val _serviceEnabled = MutableStateFlow(readServiceEnabled(sp))
+
+    /** The user's global AudioBridge switch; off = the service must not run (boot, updates, app start included). */
+    val serviceEnabled: StateFlow<Boolean> = _serviceEnabled.asStateFlow()
+
+    /** The background service should run: switched on and at least one PC is paired. */
+    fun shouldRun(): Boolean = shouldRun(_serviceEnabled.value, _pcs.value.size)
+
     private fun readPcs(): List<PairedPc> {
         val legacyUri = sp.getString(KEY_LEGACY_URI, null) ?: return PairedPc.decodeList(sp.getString(KEY_PCS, null))
         // v1 stored a single PC; fold it into the list once.
@@ -79,6 +87,13 @@ class Prefs private constructor(private val sp: SharedPreferences) {
         _headset.value = settings
     }
 
+    /** Written synchronously: a reboot right after switching off must not start the service again. */
+    @Synchronized
+    fun setServiceEnabled(on: Boolean) {
+        sp.edit(commit = true) { writeServiceEnabled(this, on) }
+        _serviceEnabled.value = on
+    }
+
     companion object {
         private const val KEY_PCS = "paired_pcs"
         private const val KEY_LEGACY_URI = "pairing_uri"
@@ -90,6 +105,16 @@ class Prefs private constructor(private val sp: SharedPreferences) {
         private const val KEY_HEADSET_DOUBLE = "headset_double_tap"
         private const val KEY_HEADSET_TRIPLE = "headset_triple_tap"
         private const val KEY_HEADSET_TARGET = "headset_target"
+        private const val KEY_SERVICE_ENABLED = "service_enabled"
+
+        /** Missing (installs from before the switch existed) = on. */
+        fun readServiceEnabled(sp: SharedPreferences): Boolean = sp.getBoolean(KEY_SERVICE_ENABLED, true)
+
+        fun writeServiceEnabled(editor: SharedPreferences.Editor, on: Boolean) {
+            editor.putBoolean(KEY_SERVICE_ENABLED, on)
+        }
+
+        fun shouldRun(serviceEnabled: Boolean, pairedPcs: Int): Boolean = serviceEnabled && pairedPcs > 0
 
         /** Reads the headphone-button settings; missing or unknown values fall back to the defaults. */
         fun readHeadset(sp: SharedPreferences): HeadsetSettings {

@@ -126,7 +126,9 @@ class BridgeService : Service() {
         }
 
         val pcs = prefs.pcs.value
-        if (pcs.isEmpty()) {
+        // Switched off by the user (or nothing paired): a sticky restart or a late start must not keep it running.
+        // The foreground start above is still required before stopping (startForegroundService contract).
+        if (!prefs.shouldRun()) {
             stopSelf()
             return START_NOT_STICKY
         }
