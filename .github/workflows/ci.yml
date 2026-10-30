@@ -17,7 +17,7 @@ env:
   CARGO_TERM_COLOR: always
 
 # Self-hosted jobs run on the netcup server's `audiobridge` runner, which already has the
-# toolchains (Rust + targets, JDK 17, Android SDK/NDK r23, cargo-ndk 3.x, cargo-xwin + LLVM).
+# toolchains (Rust + targets, JDK 17, Android SDK/NDK r30, cargo-ndk 4.x, cargo-xwin + LLVM).
 # Fork PRs are never executed there. CARGO_BUILD_JOBS=2 leaves half of its 4 cores free.
 jobs:
   rust:
@@ -31,7 +31,7 @@ jobs:
       - name: Clippy (host)
         run: cargo clippy -p audiobridge-core -p audiobridge-android --all-targets -- -D warnings
       - name: Clippy (android arm64)
-        run: cargo ndk -t arm64-v8a clippy -p audiobridge-android --all-targets -- -D warnings
+        run: cargo ndk -t arm64-v8a --platform 26 clippy -p audiobridge-android --all-targets -- -D warnings
       - name: Core tests
         # the real-network integration tests are timing-sensitive; they are run locally
         run: cargo test -p audiobridge-core --lib --test rt_alloc

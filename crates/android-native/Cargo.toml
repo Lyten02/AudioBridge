@@ -27,8 +27,3 @@ android_logger = "0.15"
 tracing = { version = "0.1", features = ["log"] }
 # iroh's DNS resolver reads the system DNS config through ndk-context; JNI init installs the app context.
 ndk-context = "0.1"
-
-[package.metadata.ndk]
-# AAudio (libaaudio.so) exists from API 26; cargo-ndk would otherwise link against API 21 stubs.
-platform = 26
-targets = ["arm64-v8a"]

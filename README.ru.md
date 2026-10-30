@@ -53,7 +53,7 @@ AudioBridge передаёт весь звук компьютера на Android
 ```powershell
 cargo test -p audiobridge-core
 cargo build -p audiobridge-desktop --release         # target\release\AudioBridge.exe
-cd android; .\gradlew.bat :app:assembleDebug         # нужны Android SDK, NDK r23 и cargo-ndk
+cd android; .\gradlew.bat :app:assembleDebug         # нужны Android SDK, NDK r30 и cargo-ndk 4.x
 ```
 
 Подробное описание архитектуры — в [AGENTS.md](AGENTS.md). Pull request'ы приветствуются, см. [CONTRIBUTING.md](CONTRIBUTING.md).

@@ -66,7 +66,7 @@ See [AGENTS.md](AGENTS.md) for the detailed developer guide.
 ```powershell
 cargo test -p audiobridge-core
 cargo build -p audiobridge-desktop --release         # target\release\AudioBridge.exe
-cd android; .\gradlew.bat :app:assembleDebug         # needs Android SDK, NDK r23 and cargo-ndk
+cd android; .\gradlew.bat :app:assembleDebug         # needs Android SDK, NDK r30 and cargo-ndk 4.x
 ```
 
 Rust ≥ 1.92. Opus is vendored and built with `cc`, so you don't need cmake.

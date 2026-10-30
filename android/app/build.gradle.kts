@@ -68,6 +68,7 @@ dependencies {
 // Skip with -PskipRust (e.g. when the Rust toolchain is unavailable and a prebuilt .so is already present).
 val repoRoot: File = rootProject.projectDir.parentFile
 val jniLibsDir: File = project.file("src/main/jniLibs")
+val rustTargetDir: File = System.getenv("CARGO_TARGET_DIR")?.let { repoRoot.resolve(it) } ?: repoRoot.resolve("target")
 val skipRust: Boolean = providers.gradleProperty("skipRust").isPresent
 
 val buildRustLib by tasks.registering(Exec::class) {
@@ -77,7 +78,8 @@ val buildRustLib by tasks.registering(Exec::class) {
     commandLine(
         "cargo", "ndk",
         "-t", "arm64-v8a",
-        "-o", jniLibsDir.absolutePath,
+        // AAudio (libaaudio.so) exists from API 26 (= minSdk); cargo-ndk defaults to API 21.
+        "--platform", "26",
         "build", "--release",
         "-p", "audiobridge-android",
     )
@@ -87,6 +89,14 @@ val buildRustLib by tasks.registering(Exec::class) {
     // cargo tracks its own incremental state; always let it decide what to rebuild.
     outputs.upToDateWhen { false }
     onlyIf { !skipRust }
+    // Not `cargo ndk -o`: cargo-ndk 4 copies every cdylib artifact, including iroh's own cdylibs.
+    val builtLib = rustTargetDir.resolve("aarch64-linux-android/release/libaudiobridge.so")
+    val abiDir = jniLibsDir.resolve("arm64-v8a")
+    doLast {
+        abiDir.mkdirs()
+        abiDir.listFiles()?.filter { it.name != builtLib.name }?.forEach { it.delete() }
+        builtLib.copyTo(abiDir.resolve(builtLib.name), overwrite = true)
+    }
 }
 
 tasks.configureEach {
