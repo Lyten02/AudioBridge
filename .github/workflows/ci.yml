@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -12,24 +13,72 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+
+# Self-hosted jobs run on the netcup server's `audiobridge` runner, which already has the
+# toolchains (Rust + targets, JDK 17, Android SDK/NDK r23, cargo-ndk 3.x, cargo-xwin + LLVM).
+# Fork PRs are never executed there. CARGO_BUILD_JOBS=2 leaves half of its 4 cores free.
 jobs:
   rust:
-    name: Rust
-    runs-on: windows-latest
+    name: Rust (core + android)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, audiobridge]
     env:
-      CARGO_TERM_COLOR: always
+      CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Clippy
-        run: cargo clippy -p audiobridge-core -p audiobridge-desktop -p audiobridge-android --all-targets -- -D warnings
+      - name: Clippy (host)
+        run: cargo clippy -p audiobridge-core -p audiobridge-android --all-targets -- -D warnings
+      - name: Clippy (android arm64)
+        run: cargo ndk -t arm64-v8a clippy -p audiobridge-android --all-targets -- -D warnings
       - name: Core tests
         # the real-network integration tests are timing-sensitive; they are run locally
         run: cargo test -p audiobridge-core --lib --test rt_alloc
-      - name: Desktop tests
-        run: cargo test -p audiobridge-desktop
       - name: Android native host tests
         run: cargo test -p audiobridge-android
+
+  desktop:
+    name: Desktop (cargo-xwin)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, audiobridge]
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clippy
+        run: cargo xwin clippy -p audiobridge-desktop --target x86_64-pc-windows-msvc --all-targets -- -D warnings
+      - name: Build
+        run: cargo xwin build -p audiobridge-desktop --release --target x86_64-pc-windows-msvc
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AudioBridge.exe
+          path: target/x86_64-pc-windows-msvc/release/AudioBridge.exe
+          if-no-files-found: error
+
+  android:
+    name: Android APK
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, audiobridge]
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assemble + unit tests
+        run: cd android && bash ./gradlew :app:assembleDebug :app:testDebugUnitTest
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-debug.apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+  desktop-tests:
+    # the desktop crate's tests need a real Windows host, so this one stays GitHub-hosted
+    name: Desktop tests (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Desktop tests
+        run: cargo test -p audiobridge-desktop
