@@ -65,8 +65,8 @@ cargo test -p audiobridge-android                  # host-only pure modules (sta
 cargo clippy -p <crate> --all-targets -- -D warnings
 cargo build -p audiobridge-desktop --release       # target\release\AudioBridge.exe
 powershell -File scripts\install-desktop.ps1 [-SkipBuild] [-NoFirewall]
-cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs build --release -p audiobridge-android
-cargo ndk -t arm64-v8a clippy -p audiobridge-android --all-targets -- -D warnings   # Android clippy needs cargo-ndk (cc needs NDK clang)
+cargo ndk -t arm64-v8a --platform 26 build --release -p audiobridge-android   # target/aarch64-linux-android/release/libaudiobridge.so (no -o: cargo-ndk 4 would also copy iroh's cdylibs)
+cargo ndk -t arm64-v8a --platform 26 clippy -p audiobridge-android --all-targets -- -D warnings   # Android clippy needs cargo-ndk (cc needs NDK clang)
 ```
 - Debug-only isolation: `AUDIOBRIDGE_DEV_DIR=<absolute temp directory>` gives a separate identity, logs and instance mutex/events; seed `settings.json` with `"autostart": false` before testing beside the installed app. Release builds ignore this variable.
 - **APK:** run Gradle from inside `android/` (PowerShell: `Set-Location android; .\gradlew.bat :app:assembleDebug`). It runs `buildRustLib` (cargo-ndk) automatically; add `-PskipRust` to reuse the `.so` already in `jniLibs`. Also: `:app:testDebugUnitTest`, `:app:lintDebug`.
@@ -117,8 +117,8 @@ cargo ndk -t arm64-v8a clippy -p audiobridge-android --all-targets -- -D warning
 - **Rust:** stable rustc ≥ 1.92 (eframe 0.35). Developed on 1.94.1; there is no `rust-toolchain` file. Don't bump eframe without checking its MSRV.
 - **Opus:** vendored native libopus (`crates/opus-sys`, float build, `USE_ALLOCA`) built with `cc`. Keep stack temporaries (`USE_ALLOCA`/`VAR_ARRAYS`): decoding runs inside `PlayoutHandle::fill`, so it must not heap-allocate. Don't switch back to `unsafe-libopus` (its c2rust VLAs allocate on every decode).
 - **Android:**
-  - NDK r23 (`23.1.7779620`) via cargo-ndk.
-  - `[package.metadata.ndk] platform = 26`, because AAudio starts at API 26.
+  - NDK r30 (`30.0.16248370`) via cargo-ndk 4.x.
+  - Always pass `--platform 26` to cargo-ndk, because AAudio starts at API 26 (cargo-ndk 4 ignores `[package.metadata.ndk]` and defaults to API 21, which fails with `-laaudio`).
   - Use raw `ndk-sys` AAudio; API-28 setters are looked up with `dlsym`. Never enable the `ndk` crate's `api-level-28` feature: the library would fail to load on API 26/27.
   - Input preset `VoiceRecognition`, never `VoiceCommunication`, which forces Bluetooth SCO/HFP and ruins A2DP.
 - **Android build:** AGP 8.10.1, Kotlin 2.2.0, Gradle 8.11.1 wrapper, JDK 17 target. Compose versions are pinned explicitly (no BOM). `FAIL_ON_PROJECT_REPOS` means repositories are declared only in `settings.gradle.kts`.
