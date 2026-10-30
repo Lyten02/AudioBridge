@@ -83,6 +83,13 @@ pub fn run_window() {
         renderer: eframe::Renderer::Glow,
         centered: true,
         run_and_return: true,
+        // Wayland: with vsync, EGL's swap waits for the compositor's frame callback, and
+        // compositors send none to a window on a hidden workspace. The UI thread then stops
+        // answering compositor pings (Hyprland offers to kill the "not responding" app with
+        // SIGKILL) and cannot exit on SIGTERM/"Выход" until the window is shown again. The UI
+        // repaints only on changes (every 40 ms at most while streaming), so it needs no vsync.
+        #[cfg(target_os = "linux")]
+        glow_options: eframe::egui_glow::GlowConfiguration { vsync: false, ..Default::default() },
         ..Default::default()
     };
     let result = eframe::run_native(
