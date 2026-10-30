@@ -1,3 +1,4 @@
+import java.util.Properties
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
@@ -5,6 +6,12 @@ plugins {
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
 }
+
+// Release signing key: AUDIOBRIDGE_KEYSTORE_PROPS names a properties file with storeFile, storePassword,
+// keyAlias and keyPassword. Without it the release APK is built unsigned; debug builds are unaffected.
+val releaseKeystoreProps: Properties? = providers.environmentVariable("AUDIOBRIDGE_KEYSTORE_PROPS").orNull
+    ?.takeIf { it.isNotBlank() }
+    ?.let { path -> Properties().apply { file(path).inputStream().use { load(it) } } }
 
 android {
     namespace = "app.audiobridge"
@@ -21,11 +28,23 @@ android {
         }
     }
 
+    signingConfigs {
+        releaseKeystoreProps?.let { props ->
+            create("release") {
+                storeFile = file(props.getProperty("storeFile"))
+                storePassword = props.getProperty("storePassword")
+                keyAlias = props.getProperty("keyAlias")
+                keyPassword = props.getProperty("keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            signingConfig = signingConfigs.findByName("release")
         }
     }
 
