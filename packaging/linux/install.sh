@@ -31,7 +31,8 @@ if [ "${1:-}" = "--uninstall" ]; then
 fi
 
 missing=()
-ldconfig -p 2>/dev/null | grep -q 'libpipewire-0\.3\.so\.0' || missing+=("pipewire (libpipewire-0.3.so.0)")
+# Consume the complete cache: grep -q can SIGPIPE ldconfig under pipefail.
+ldconfig -p 2>/dev/null | grep 'libpipewire-0\.3\.so\.0' >/dev/null || missing+=("pipewire (libpipewire-0.3.so.0)")
 command -v wpctl >/dev/null || missing+=("wireplumber (wpctl)")
 if [ ${#missing[@]} -gt 0 ]; then
     echo "Missing runtime dependencies: ${missing[*]}" >&2
