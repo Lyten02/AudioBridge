@@ -27,7 +27,7 @@ use crate::icon;
 use crate::shared::shared;
 
 const WM_TRAY_CALLBACK: u32 = WM_APP + 1;
-pub const WM_TRAY_REFRESH: u32 = WM_APP + 2;
+const WM_TRAY_REFRESH: u32 = WM_APP + 2;
 const WM_TRAY_QUIT: u32 = WM_APP + 3;
 const TRAY_ID: u32 = 1;
 
@@ -38,6 +38,19 @@ const ID_EXIT: usize = 4;
 const ID_ENABLED: usize = 5;
 
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
+/// The hidden tray window, for refreshes posted from other threads (0 until created).
+static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
+
+/// Re-reads state and tooltip from `shared()`; safe from any thread.
+pub fn refresh() {
+    let hwnd = TRAY_HWND.load(Ordering::SeqCst);
+    if hwnd != 0 {
+        // SAFETY: posting a refresh to our own tray window.
+        unsafe {
+            let _ = PostMessageW(Some(HWND(hwnd as *mut _)), WM_TRAY_REFRESH, WPARAM(0), LPARAM(0));
+        }
+    }
+}
 static ICON_ON: AtomicIsize = AtomicIsize::new(0);
 static ICON_OFF: AtomicIsize = AtomicIsize::new(0);
 static ICON_DISABLED: AtomicIsize = AtomicIsize::new(0);
@@ -70,7 +83,7 @@ pub fn spawn() -> Result<Tray> {
                 return;
             }
         };
-        shared().set_tray_hwnd(hwnd.0 as isize);
+        TRAY_HWND.store(hwnd.0 as isize, Ordering::SeqCst);
         // SAFETY: creating icons and adding the notification icon for our own window.
         unsafe {
             let size = GetSystemMetrics(SM_CXSMICON).max(16) as u32;

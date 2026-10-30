@@ -1,27 +1,41 @@
-//! AudioBridge for Windows: streams PC audio to the paired phone and exposes the phone
-//! microphone through VB-CABLE. Lives in the notification area.
+//! AudioBridge for Windows and Linux: streams PC audio to the paired phone and exposes the phone
+//! microphone as a PC microphone (VB-CABLE on Windows, a PipeWire virtual source on Linux).
+//! Lives in the notification area / tray.
 //!
 //! Command line:
 //! * `--background` — start hidden in the tray (used by the autostart entry).
 //! * `--print-pairing` — print the pairing URI (the QR content) to stdout and exit. If AudioBridge
-//!   is already running, prints the URI the running instance published to
-//!   `%APPDATA%\AudioBridge\pairing.txt`; otherwise starts the server just long enough to obtain it.
-//! * `--no-install` — run from the current location instead of self-installing (release builds
-//!   started from anywhere else copy themselves to `%LOCALAPPDATA%\Programs\AudioBridge`,
-//!   register autostart there, launch that copy and exit).
+//!   is already running, prints the URI the running instance published to `pairing.txt` in the
+//!   data directory; otherwise starts the server just long enough to obtain it.
+//! * `--no-install` (Windows) — run from the current location instead of self-installing
+//!   (release builds started from anywhere else copy themselves to
+//!   `%LOCALAPPDATA%\Programs\AudioBridge`, register autostart there, launch that copy and exit).
+//! * `--quit` (Linux) — ask the running instance to exit (used by the package scripts).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg(not(any(windows, target_os = "linux")))]
+compile_error!("AudioBridge desktop supports Windows and Linux");
+
+#[cfg_attr(target_os = "linux", path = "linux/audio/mod.rs")]
 mod audio;
-mod cable_install;
+#[cfg_attr(target_os = "linux", path = "linux/autostart.rs")]
 mod autostart;
+#[cfg(windows)]
+mod cable_install;
+mod endpoints;
 mod icon;
+#[cfg_attr(target_os = "linux", path = "linux/instance.rs")]
 mod instance;
+#[cfg_attr(target_os = "linux", path = "linux/media.rs")]
 mod media;
+#[cfg_attr(target_os = "linux", path = "linux/paths.rs")]
 mod paths;
+#[cfg(windows)]
+mod selfinstall;
 mod service;
 mod settings;
 mod shared;
-mod selfinstall;
+#[cfg_attr(target_os = "linux", path = "linux/tray.rs")]
 mod tray;
 mod ui;
 
@@ -33,11 +47,17 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use audiobridge_core::pairing::PairingInfo;
 use audiobridge_core::session::{Server, ServerConfig};
+#[cfg(windows)]
 use windows::core::{w, HSTRING};
+#[cfg(windows)]
 use windows::Win32::System::Console::{AttachConsole, GetStdHandle, ATTACH_PARENT_PROCESS, STD_OUTPUT_HANDLE};
+#[cfg(windows)]
 use windows::Win32::System::ProcessStatus::K32EmptyWorkingSet;
+#[cfg(windows)]
 use windows::Win32::System::Threading::GetCurrentProcess;
+#[cfg(windows)]
 use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+#[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
 
 use crate::settings::Settings;
@@ -47,8 +67,13 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let has = |flag: &str| args.iter().any(|a| a == flag);
     // SAFETY: process-wide setting before any window exists; failure (already set) is harmless.
+    #[cfg(windows)]
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+    #[cfg(target_os = "linux")]
+    if has("--quit") {
+        return if instance::signal_quit() { ExitCode::SUCCESS } else { ExitCode::FAILURE };
     }
     let data_dir = paths::data_dir();
     if let Err(e) = std::fs::create_dir_all(&data_dir) {
@@ -66,6 +91,7 @@ fn main() -> ExitCode {
     }
     let _log_guard = init_logging();
     install_panic_hook();
+    #[cfg(windows)]
     if selfinstall::needed(&args) {
         match selfinstall::install_and_launch(&args, &data_dir) {
             Ok(()) => return ExitCode::SUCCESS,
@@ -125,6 +151,8 @@ fn run(primary: instance::Primary, background: bool, data_dir: &Path) -> Result<
     let tray = tray::spawn().context("tray icon")?;
     primary.listen_for_show(|| shared().show_window());
     primary.listen_for_quit(|| shared().request_exit());
+    #[cfg(target_os = "linux")]
+    exit_on_signals();
 
     if !background {
         ui::run_window();
@@ -145,6 +173,59 @@ fn run(primary: instance::Primary, background: bool, data_dir: &Path) -> Result<
     let _ = supervisor.join();
     tray.quit();
     Ok(())
+}
+
+/// SIGTERM/SIGINT/SIGHUP (logout, `kill`, Ctrl+C) run the normal shutdown, so the PipeWire
+/// nodes and the default-device changes are cleaned up like on "Выход".
+#[cfg(target_os = "linux")]
+fn exit_on_signals() {
+    use std::os::unix::net::UnixDatagram;
+
+    static WAKE: std::sync::OnceLock<UnixDatagram> = std::sync::OnceLock::new();
+    extern "C" fn on_signal(_: libc_shim::c_int) {
+        // Only async-signal-safe work here: a non-blocking send wakes the watcher thread.
+        if let Some(w) = WAKE.get() {
+            let _ = w.send(&[1]);
+        }
+    }
+    let Ok((tx, rx)) = UnixDatagram::pair() else {
+        tracing::warn!("signal handling unavailable");
+        return;
+    };
+    let _ = tx.set_nonblocking(true);
+    if WAKE.set(tx).is_err() {
+        return;
+    }
+    for sig in [libc_shim::SIGTERM, libc_shim::SIGINT, libc_shim::SIGHUP] {
+        // SAFETY: installs a handler that only performs an async-signal-safe send(2).
+        unsafe {
+            libc_shim::signal(sig, on_signal as *const () as libc_shim::sighandler_t);
+        }
+    }
+    let spawned = std::thread::Builder::new().name("signals".into()).spawn(move || {
+        let mut buf = [0u8; 1];
+        if rx.recv(&mut buf).is_ok() {
+            tracing::info!("termination signal received");
+            shared().request_exit();
+        }
+    });
+    if let Err(e) = spawned {
+        tracing::warn!("signal thread: {e}");
+    }
+}
+
+/// The two libc entry points the signal handling needs (std links libc already).
+#[cfg(target_os = "linux")]
+mod libc_shim {
+    #![allow(non_camel_case_types)]
+    pub type c_int = i32;
+    pub type sighandler_t = usize;
+    pub const SIGHUP: c_int = 1;
+    pub const SIGINT: c_int = 2;
+    pub const SIGTERM: c_int = 15;
+    unsafe extern "C" {
+        pub fn signal(signum: c_int, handler: sighandler_t) -> sighandler_t;
+    }
 }
 
 /// `--print-pairing`: see the crate docs.
@@ -180,6 +261,7 @@ fn print_pairing(data_dir: &Path) -> Result<()> {
 }
 
 /// Release builds are GUI-subsystem: attach to the parent console only if stdout isn't redirected.
+#[cfg(windows)]
 fn attach_console() {
     // SAFETY: plain console API calls.
     unsafe {
@@ -189,6 +271,10 @@ fn attach_console() {
         }
     }
 }
+
+/// Linux processes always have their parent's stdout.
+#[cfg(target_os = "linux")]
+fn attach_console() {}
 
 fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     use tracing_subscriber::filter::Targets;
@@ -231,6 +317,7 @@ fn install_panic_hook() {
 }
 
 /// Return memory touched by the (now destroyed) window to the OS.
+#[cfg(windows)]
 fn trim_working_set() {
     // SAFETY: pseudo-handle of the current process.
     unsafe {
@@ -238,9 +325,25 @@ fn trim_working_set() {
     }
 }
 
+/// glibc returns freed pages on its own; nothing to force.
+#[cfg(target_os = "linux")]
+fn trim_working_set() {}
+
+#[cfg(windows)]
 fn fatal(text: &str) {
     // SAFETY: modal message box with valid strings.
     unsafe {
         MessageBoxW(None, &HSTRING::from(text), w!("AudioBridge"), MB_OK | MB_ICONERROR);
     }
+}
+
+/// stderr plus a desktop notification (started from the launcher there is no terminal).
+#[cfg(target_os = "linux")]
+fn fatal(text: &str) {
+    eprintln!("AudioBridge: {text}");
+    let _ = std::process::Command::new("notify-send")
+        .args(["--app-name=AudioBridge", "--urgency=critical", "AudioBridge", text])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }

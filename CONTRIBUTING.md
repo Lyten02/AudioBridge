@@ -22,6 +22,8 @@ cargo test -p audiobridge-android
 
 `cargo test -p audiobridge-core` also runs real-network integration tests. They are timing-sensitive, so run them on an idle machine.
 
+On Linux, `audiobridge-desktop` builds the PipeWire version and needs the PipeWire development files (`pkg-config libpipewire-0.3`) and `clang`; on Windows (or with `cargo xwin … --target x86_64-pc-windows-msvc`) it builds the WASAPI version. Platform code must compile cleanly on both.
+
 For Android changes: `cd android; .\gradlew.bat :app:testDebugUnitTest :app:lintDebug`.
 
 ## Ground rules
@@ -29,6 +31,6 @@ For Android changes: `cd android; .\gradlew.bat :app:testDebugUnitTest :app:lint
 - **Real-time audio code** (`CaptureHandle::push`, `PlayoutHandle::fill`, the mixer and playout) must never allocate, lock or block. `tests/rt_alloc.rs` enforces this.
 - The **wire format** (`crates/core/src/proto.rs`, `pairing.rs`) is shared by both apps. An incompatible change must bump the protocol or pairing version.
 - **UI text** is Russian, code, comments and logs are English.
-- Things that can't be unit-tested (WASAPI, AAudio, the UI, the Android service) need a short note in the PR on how you checked them on real hardware.
+- Things that can't be unit-tested (WASAPI, PipeWire, AAudio, the UI, the Android service) need a short note in the PR on how you checked them on real hardware.
 
 See [AGENTS.md](AGENTS.md) for the architecture and conventions.

@@ -61,6 +61,16 @@ pub struct Hooks {
 const TICK: Duration = Duration::from_secs(1);
 const RETRY: Duration = Duration::from_secs(2);
 
+/// Sender half of the engine's command channel.
+pub type AudioSender = Sender<AudioMsg>;
+
+/// The current device landscape, read now (not a stale notification snapshot).
+pub fn current_devices() -> Option<DeviceSummary> {
+    let _com = Com::init();
+    let enumerator = com::enumerator().ok()?;
+    Some(devices::summarize(&enumerator))
+}
+
 pub struct AudioEngine {
     tx: Sender<AudioMsg>,
     join: JoinHandle<()>,
@@ -76,7 +86,7 @@ impl AudioEngine {
         Ok(Self { tx, join })
     }
 
-    pub fn sender(&self) -> Sender<AudioMsg> {
+    pub fn sender(&self) -> AudioSender {
         self.tx.clone()
     }
 
