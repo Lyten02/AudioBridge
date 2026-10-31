@@ -162,6 +162,12 @@ impl VirtualMic {
             properties! {
                 "media.class" => "Audio/Source",
                 *pw::keys::NODE_VIRTUAL => "true",
+                // This is a network-fed source, not an autonomous leaf producer. PipeWire 1.6
+                // can run an ungrouped leaf just because its previous driver is still active
+                // (e.g. unrelated playback), activating idle passive filters as a side effect.
+                // A dedicated link group keeps scheduling demand-driven; do not share it with
+                // our PC-audio capture, which has independent consumers.
+                "node.link-group" => "audiobridge.mic",
                 *pw::keys::NODE_NAME => MIC_NODE_NAME,
                 *pw::keys::NODE_DESCRIPTION => MIC_NODE_DESCRIPTION,
                 *pw::keys::NODE_LATENCY => LATENCY,

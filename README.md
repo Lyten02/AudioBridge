@@ -53,6 +53,10 @@ On Linux the phone mic appears as the input «AudioBridge: микрофон те
 
 Linux mic demand requires an **Active** outgoing PipeWire link as well as a streaming source. Link activity is followed through PipeWire events: a permanent passive filter route does not request the microphone while idle, but does while a downstream app records through it. The adapter can remain `Streaming` after the last reader closes; this no longer keeps the phone microphone active. Reader changes are also recorded while the phone is disconnected, so the next connection starts with current demand rather than stale demand. No Android update or protocol change is needed.
 
+The network-fed source has its own PipeWire link group, separate from PC-audio capture. This prevents PipeWire 1.6's passive-leaf scheduling from keeping the source and idle filters running just because an unrelated playback driver is active. Passive routes remain supported; they are not excluded from demand detection.
+
+Run these checks while unrelated audio playback keeps a driver active, not only in an otherwise idle graph.
+
 To check the lifecycle, open two readers on `audiobridge_mic`: closing one must keep the mic active, closing the last must return the phone to standby. Repeat after a timeout/reconnect, including closing the last reader while disconnected, and after stopping/restarting AudioBridge. Also keep a passive filter route connected: idle must stay in standby, recording through the filter must activate the mic, and pausing or closing the last downstream reader must return it to standby without removing the passive route. Check link **state** as well as live graph nodes/links, not only the remembered default-device name. Starting or restarting the app observes the existing output volume; volume writes require a local or remote control action.
 
 ## How it works
