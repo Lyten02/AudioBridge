@@ -22,6 +22,7 @@ use audiobridge_core::audio::{CaptureHandle, PlayoutHandle};
 use audiobridge_core::session::Volume;
 use pipewire as pw;
 use pw::core::CoreRc;
+use pw::link::{Link, LinkListener, LinkState};
 use pw::metadata::{Metadata, MetadataListener};
 use pw::node::{Node, NodeListener};
 use pw::properties::{properties, PropertiesBox};
@@ -207,12 +208,19 @@ struct SinkWatch {
     _node: Node,
 }
 
+/// A graph link and its event subscription; listener drops before the proxy.
+struct LinkWatch {
+    _listener: LinkListener,
+    _link: Link,
+}
+
 /// Objects of one PipeWire connection.
 struct Session {
     mainloop: pw::main_loop::MainLoopWeak,
     core: CoreRc,
     registry: RegistryRc,
     graph: Graph,
+    links: HashMap<u32, LinkWatch>,
     /// Audio device node globals, to bind the default sink when it becomes the default.
     globals: HashMap<u32, GlobalObject<PropertiesBox>>,
     metadata: Option<(u32, Metadata, MetadataListener)>,
@@ -228,6 +236,7 @@ struct Session {
 enum Ev {
     Global(GlobalObject<PropertiesBox>),
     Removed(u32),
+    LinkActive(u32, bool),
     Meta(String, Option<String>),
     Props(u32, PropsUpdate),
     MicState(StreamState),
@@ -309,6 +318,7 @@ fn run_session(engine: Engine, rx: pw::channel::Receiver<AudioMsg>) -> Back {
         core: core.clone(),
         registry: registry.clone(),
         graph: Graph::default(),
+        links: HashMap::new(),
         globals: HashMap::new(),
         metadata: None,
         sink: None,
@@ -379,6 +389,7 @@ fn run_session(engine: Engine, rx: pw::channel::Receiver<AudioMsg>) -> Back {
         s.mic = None;
         s.sink = None;
         s.metadata = None;
+        s.links.clear();
     }
     let ctx = match Rc::try_unwrap(ctx) {
         Ok(ctx) => ctx,
@@ -404,6 +415,7 @@ impl Inner {
             Ev::Global(obj) => s.global(obj, ctx),
             Ev::Removed(id) => {
                 s.graph.remove(id);
+                s.links.remove(&id);
                 s.globals.remove(&id);
                 if s.sink.as_ref().is_some_and(|w| w.id == id) {
                     s.sink = None;
@@ -412,6 +424,7 @@ impl Inner {
                     s.metadata = None;
                 }
             }
+            Ev::LinkActive(id, active) => s.graph.set_link_active(id, active),
             Ev::Meta(key, value) => {
                 s.graph.defaults.apply(&key, value.as_deref());
             }
@@ -512,7 +525,7 @@ impl Inner {
             tracing::info!("loopback stopped");
         }
 
-        engine.demand = s.mic_streaming && s.graph.mic_has_readers();
+        engine.demand = s.graph.mic_demand(s.mic_streaming);
         let volume = s.sink.as_ref().and_then(|w| w.volume);
         engine.report(volume);
     }
@@ -537,6 +550,20 @@ impl Session {
             }
             ObjectType::Link => {
                 self.graph.add_link(obj.id, get("link.output.node"), get("link.input.node"));
+                let link = match self.registry.bind::<Link, _>(&obj) {
+                    Ok(link) => link,
+                    Err(e) => {
+                        tracing::warn!("binding graph link {}: {e}", obj.id);
+                        return;
+                    }
+                };
+                let id = obj.id;
+                let post = ctx.poster();
+                let listener = link
+                    .add_listener_local()
+                    .info(move |info| post(Ev::LinkActive(id, matches!(info.state(), LinkState::Active))))
+                    .register();
+                self.links.insert(id, LinkWatch { _listener: listener, _link: link });
             }
             ObjectType::Metadata if get("metadata.name") == Some("default") => {
                 let metadata = match self.registry.bind::<Metadata, _>(&obj) {

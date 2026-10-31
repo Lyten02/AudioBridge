@@ -66,13 +66,20 @@ pub fn node_name_json(name: &str) -> String {
     serde_json::json!({ "name": name }).to_string()
 }
 
+#[derive(Clone, Debug)]
+struct LinkEntry {
+    output: u32,
+    input: u32,
+    active: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Graph {
     /// Audio device nodes by global id.
     pub nodes: BTreeMap<u32, NodeEntry>,
     pub defaults: Defaults,
     /// Links by global id, including readers (which are not device nodes).
-    links: BTreeMap<u32, (u32, u32)>,
+    links: BTreeMap<u32, LinkEntry>,
 }
 
 impl Graph {
@@ -90,21 +97,28 @@ impl Graph {
             output.and_then(|v| v.parse().ok()),
             input.and_then(|v| v.parse().ok()),
         ) {
-            self.links.insert(id, (output, input));
+            self.links.insert(id, LinkEntry { output, input, active: false });
+        }
+    }
+
+    /// Link info is authoritative for consumption, including passive filter routes.
+    pub fn set_link_active(&mut self, id: u32, active: bool) {
+        if let Some(link) = self.links.get_mut(&id) {
+            link.active = active;
         }
     }
 
     pub fn remove(&mut self, id: u32) -> bool {
         self.links.remove(&id);
-        self.links.retain(|_, (output, input)| *output != id && *input != id);
+        self.links.retain(|_, link| link.output != id && link.input != id);
         self.nodes.remove(&id).is_some()
     }
 
-    /// A source adapter can stay Streaming after its last consumer is unlinked.
-    /// Demand therefore also requires a live outgoing graph link, not just stream state.
-    pub fn mic_has_readers(&self) -> bool {
-        self.find(MIC_NODE_NAME).is_some_and(|(mic, _)| {
-            self.links.values().any(|(output, _)| *output == mic)
+    /// A source adapter can stay Streaming without consumption. A persistent passive
+    /// route counts while Active, but not while Paused after its downstream reader closes.
+    pub fn mic_demand(&self, streaming: bool) -> bool {
+        streaming && self.find(MIC_NODE_NAME).is_some_and(|(mic, _)| {
+            self.links.values().any(|link| link.output == mic && link.active)
         })
     }
 
@@ -161,7 +175,7 @@ mod tests {
         let mut g = Graph::default();
         g.add_node(40, Some("alsa_output.speakers"), Some("Speakers"), Some("Audio/Sink"));
         g.add_node(41, Some("alsa_input.mic"), Some("Built-in Mic"), Some("Audio/Source"));
-        g.add_node(42, Some(MIC_NODE_NAME), Some("AudioBridge"), Some("Audio/Source/Virtual"));
+        g.add_node(42, Some(MIC_NODE_NAME), Some("AudioBridge"), Some("Audio/Source"));
         g.add_node(43, Some("firefox"), None, Some("Stream/Output/Audio"));
         g.defaults.apply("default.audio.sink", Some(r#"{"name":"alsa_output.speakers"}"#));
         g.defaults.apply("default.audio.source", Some(r#"{"name":"alsa_input.mic"}"#));
@@ -206,32 +220,70 @@ mod tests {
     fn mic_demand_ends_only_when_the_last_reader_link_is_removed() {
         let mut g = graph();
         g.add_link(60, Some("41"), Some("50")); // unrelated microphone
-        assert!(!g.mic_has_readers());
+        g.set_link_active(60, true);
+        assert!(!g.mic_demand(true));
         g.add_link(61, Some("42"), Some("51"));
+        g.set_link_active(61, true);
         g.add_link(62, Some("42"), Some("52"));
-        assert!(g.mic_has_readers());
+        g.set_link_active(62, true);
+        assert!(g.mic_demand(true));
         g.remove(61);
-        assert!(g.mic_has_readers());
+        assert!(g.mic_demand(true));
         g.remove(62);
-        assert!(!g.mic_has_readers());
+        assert!(!g.mic_demand(true));
         g.add_link(63, Some("42"), Some("53"));
-        assert!(g.mic_has_readers());
+        g.set_link_active(63, true);
+        assert!(g.mic_demand(true));
         g.remove(53); // reader node removal can precede its link removal
-        assert!(!g.mic_has_readers());
+        assert!(!g.mic_demand(true));
     }
 
     #[test]
     fn removed_mic_and_reused_node_ids_do_not_keep_demand() {
         let mut g = graph();
         g.add_link(60, Some("42"), Some("51"));
-        assert!(g.mic_has_readers());
+        g.set_link_active(60, true);
+        assert!(g.mic_demand(true));
         g.remove(42);
-        assert!(!g.mic_has_readers());
+        assert!(!g.mic_demand(true));
         g.add_node(42, Some(MIC_NODE_NAME), None, Some("Audio/Source"));
-        assert!(!g.mic_has_readers());
+        assert!(!g.mic_demand(true));
         g.add_link(61, Some("42"), Some("51"));
-        assert!(g.mic_has_readers());
-        // A new PipeWire session starts with an empty graph, never stale links.
-        assert!(!Graph::default().mic_has_readers());
+        g.set_link_active(61, true);
+        assert!(g.mic_demand(true));
+    }
+    #[test]
+    fn passive_route_requires_active_consumption_even_with_stale_streaming() {
+        let mut g = graph();
+        g.add_link(60, Some("42"), Some("50")); // persistent passive filter input
+        assert!(!g.mic_demand(true)); // unknown/paused route, not a reader
+        g.set_link_active(60, true); // downstream recording activates the same route
+        assert!(g.mic_demand(true));
+        assert!(!g.mic_demand(false)); // link activation can arrive before Streaming
+        g.set_link_active(60, false); // last downstream reader closed; route remains
+        assert!(!g.mic_demand(true)); // late/stale Streaming cannot reactivate demand
+        g.set_link_active(60, true); // a new downstream recording is still supported
+        assert!(g.mic_demand(true));
+    }
+
+    #[test]
+    fn direct_and_passive_routes_handle_both_close_event_orders() {
+        for pause_first in [false, true] {
+            let mut g = graph();
+            g.add_link(60, Some("42"), Some("50")); // idle passive filter
+            g.add_link(61, Some("42"), Some("51")); // direct reader
+            g.set_link_active(61, true);
+            assert!(g.mic_demand(true));
+            if pause_first {
+                assert!(!g.mic_demand(false));
+                g.set_link_active(61, false);
+                assert!(!g.mic_demand(true));
+            }
+            g.remove(51); // node removal may precede link removal/state notification
+            g.set_link_active(61, true); // an already queued info must not resurrect it
+            assert!(!g.mic_demand(true));
+            g.remove(61);
+            assert!(!g.mic_demand(true));
+        }
     }
 }
