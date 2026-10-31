@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=AudioBridge
+GenericName=Phone as headphones and microphone
+GenericName[ru]=Телефон как наушники и микрофон
+Comment=PC audio to the phone, phone microphone to the PC
+Comment[ru]=Звук компьютера на телефон, микрофон телефона на компьютер
+Exec=audiobridge
+Icon=audiobridge
+Terminal=false
+Categories=AudioVideo;Audio;Utility;
+Keywords=audio;sound;phone;android;headphones;microphone;mic;bluetooth;pipewire;аудиобридж;аудио бридж;звук;телефон;наушники;микрофон;
+StartupWMClass=audiobridge
+StartupNotify=false

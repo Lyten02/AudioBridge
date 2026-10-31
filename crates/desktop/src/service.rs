@@ -92,9 +92,7 @@ fn set_default(id: &str, what: &str) {
 }
 
 fn restore_devices(enabled: bool) {
-    let _com = audio::com::Com::init();
-    let Ok(enumerator) = audio::com::enumerator() else { return };
-    let devices = audio::devices::summarize(&enumerator);
+    let Some(devices) = audio::current_devices() else { return };
     let settings = shared().settings();
     // Inspect current devices, not a stale asynchronous notification snapshot.
     shared().set_devices(&devices);

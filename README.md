@@ -2,7 +2,7 @@
 
 ![AudioBridge: your phone as wireless headphones and microphone for your PC](docs/screenshots/hero.png)
 
-**Your phone becomes the wireless headphones and microphone of your Windows PC.**
+**Your phone becomes the wireless headphones and microphone of your Windows or Linux PC.**
 
 AudioBridge streams everything your PC plays to your Android phone, which plays it in the Bluetooth headphones connected to the phone. In the other direction, the phone's microphone shows up on the PC as a regular microphone for Discord, Zoom, OBS or games.
 
@@ -21,32 +21,43 @@ Pair once by scanning a QR code. After that both apps run in the background, sta
 ## Features
 
 - **PC audio → phone → Bluetooth headphones.** Opus at 192 kbit/s stereo, 48 kHz. Around 30–40 ms of network latency on Wi-Fi; Bluetooth itself adds its usual 100–200 ms on top.
-- **Phone mic → PC.** Shows up as `CABLE Output` (VB-CABLE). The phone only sends the mic while some app on the PC is actually recording.
+- **Phone mic → PC.** On Windows it shows up as `CABLE Output` (VB-CABLE); on Linux AudioBridge creates its own PipeWire microphone «AudioBridge: микрофон телефона» (no driver needed, it disappears when the app exits). The phone only sends the mic while some app on the PC is actually recording.
 - **One-scan pairing.** The PC shows a QR code, the phone scans it, and that's it.
 - **Works across networks.** Peer-to-peer over [iroh](https://iroh.computer) QUIC: LAN, NAT hole punching, Tailscale, or an encrypted relay as a last resort. The phone and the PC don't need to share a Wi-Fi network.
 - **Several PCs at once.** Pair up to 8 computers (desktop, laptop, …). Their audio is mixed, and the mic goes only to the ones that use it. Mute one PC, or all of them with a single button, right from the phone; they stay connected.
-- **Full remote control from either side.** From the PC: PC and phone volume, the phone mic, and the Windows default mic. From the phone: the PC's audio and mic switches, its volume and mute. The PC's "Mic" switch does everything at once: it turns the phone mic on and makes `CABLE Output` the Windows default mic; switching it off restores your previous mic.
-- **Headphone buttons control the music on the PC.** With the earbuds connected to the phone, double tap pauses/resumes and triple tap skips tracks in the PC's player (Yandex Music, Spotify, a browser — anything in the Windows media overlay), also with the phone screen off. With several PCs, the buttons control exactly one: the one playing, or the one you pick. A "Single earbud" mode lets you choose the 2- and 3-tap actions so either earbud alone can do everything. Volume taps keep changing the phone volume (what you hear): Android doesn't tell apps about them, so they can't be remapped.
+- **Full remote control from either side.** From the PC: PC and phone volume, the phone mic, and the default mic. From the phone: the PC's audio and mic switches, its volume and mute. The PC's "Mic" switch does everything at once: it turns the phone mic on and makes the virtual mic the default mic; switching it off restores your previous mic.
+- **Headphone buttons control the music on the PC.** With the earbuds connected to the phone, double tap pauses/resumes and triple tap skips tracks in the PC's player (Yandex Music, Spotify, a browser — anything in the Windows media overlay, or any MPRIS player on Linux), also with the phone screen off. With several PCs, the buttons control exactly one: the one playing, or the one you pick. A "Single earbud" mode lets you choose the 2- and 3-tap actions so either earbud alone can do everything. Volume taps keep changing the phone volume (what you hear): Android doesn't tell apps about them, so they can't be remapped.
 - **Background and autostart** on both sides. Low CPU: about 1–2 % of one core on the PC, 4–5 % on the phone while playing.
-- **PC service on/off:** «Выключить AudioBridge» in the window or tray disconnects this PC, stops audio and media integration, and restores non-CABLE default devices where available. «Включить AudioBridge» restores the saved feature settings and pairing without rescanning. Off stays off after restarting Windows; other PCs and the phone's switches are untouched. Closing the window only returns it to the tray; reopen it with the tray icon or another launch.
+- **PC service on/off:** «Выключить AudioBridge» in the window or tray disconnects this PC, stops audio and media integration, and restores your own default mic (and, on Windows, non-CABLE playback) where available. «Включить AudioBridge» restores the saved feature settings and pairing without rescanning. Off stays off after a restart; other PCs and the phone's switches are untouched. Closing the window only returns it to the tray; reopen it with the tray icon or another launch.
 - **End-to-end encrypted** (QUIC/TLS) and authenticated by the pairing secret from the QR code.
 
 ## Requirements
 
 | | |
 |---|---|
-| PC | Windows 10/11 x64 |
+| PC | Windows 10/11 x64, or Linux x86_64 with PipeWire and WirePlumber (tested on Arch / Omarchy) |
 | Phone | Android 8.0+ (arm64) |
-| Mic on PC | [VB-CABLE](https://vb-audio.com/Cable/) (free); the app offers to install it |
+| Mic on PC | Windows: [VB-CABLE](https://vb-audio.com/Cable/) (free); the app offers to install it. Linux: nothing extra |
 
 The UI is in Russian for now. Translations are welcome.
 
 ## Install
 
-1. Download `AudioBridge.exe` and `AudioBridge.apk` from [Releases](https://github.com/Lyten02/AudioBridge/releases).
+1. Download `AudioBridge.apk` and the PC app from [Releases](https://github.com/Lyten02/AudioBridge/releases): `AudioBridge.exe` for Windows, `audiobridge-<version>-1-x86_64.pkg.tar.zst` (Arch) or `AudioBridge-<version>-linux-x86_64.tar.gz` (any distro) for Linux.
 2. **PC:** run `AudioBridge.exe`. It installs itself to `%LOCALAPPDATA%\Programs\AudioBridge`, enables autostart and shows a QR code. Allow it through the Windows firewall.
+   **Linux:** `sudo pacman -U audiobridge-*.pkg.tar.zst`, or unpack the `.tar.gz` and run `./install.sh` (installs to `~/.local` for your user; `./install.sh --uninstall` removes it). Start «AudioBridge» from the app launcher; it enables autostart at login and shows a QR code.
 3. **Phone:** install the APK, open it, tap «Добавить компьютер» (Add computer) and scan the QR code.
 4. On Xiaomi/HyperOS/MIUI: enable Autostart for AudioBridge, set battery to "No restrictions" and lock the app in recents, or the system will kill it.
+
+On Linux the phone mic appears as the input «AudioBridge: микрофон телефона». Pick it in an app, or switch on «Микрофон по умолчанию» in AudioBridge. On Hyprland the window can float with a rule for the class `audiobridge`.
+
+Linux mic demand requires an **Active** outgoing PipeWire link as well as a streaming source. Link activity is followed through PipeWire events: a permanent passive filter route does not request the microphone while idle, but does while a downstream app records through it. The adapter can remain `Streaming` after the last reader closes; this no longer keeps the phone microphone active. Reader changes are also recorded while the phone is disconnected, so the next connection starts with current demand rather than stale demand. No Android update or protocol change is needed.
+
+The network-fed source has its own PipeWire link group, separate from PC-audio capture. This prevents PipeWire 1.6's passive-leaf scheduling from keeping the source and idle filters running just because an unrelated playback driver is active. Passive routes remain supported; they are not excluded from demand detection.
+
+Run these checks while unrelated audio playback keeps a driver active, not only in an otherwise idle graph.
+
+To check the lifecycle, open two readers on `audiobridge_mic`: closing one must keep the mic active, closing the last must return the phone to standby. Repeat after a timeout/reconnect, including closing the last reader while disconnected, and after stopping/restarting AudioBridge. Also keep a passive filter route connected: idle must stay in standby, recording through the filter must activate the mic, and pausing or closing the last downstream reader must return it to standby without removing the passive route. Check link **state** as well as live graph nodes/links, not only the remembered default-device name. Starting or restarting the app observes the existing output volume; volume writes require a local or remote control action.
 
 ## How it works
 
@@ -55,8 +66,10 @@ PC   WASAPI loopback ─► Opus ─► QUIC datagrams ─► jitter buffer ─�
 PC   VB-CABLE ◄─ jitter buffer ◄─ QUIC datagrams ◄─ Opus ◄─ AAudio mic                              Phone
 ```
 
+On Linux, PipeWire takes the place of WASAPI and VB-CABLE: AudioBridge captures the default output's monitor and plays the phone mic into its own virtual source node.
+
 - A shared Rust core (`crates/core`) does networking, Opus encoding and the receive path. The receive path is a small NetEQ-style jitter buffer: an adaptive delay target, packet-loss concealment and clock-drift compensation.
-- `crates/desktop` is the Windows tray app (WASAPI + egui).
+- `crates/desktop` is the PC tray app (egui; WASAPI on Windows, PipeWire on Linux).
 - `crates/android-native` is the JNI library (AAudio); `android/` is the Kotlin/Compose app with a foreground service.
 
 See [AGENTS.md](AGENTS.md) for the detailed developer guide.
@@ -67,6 +80,13 @@ See [AGENTS.md](AGENTS.md) for the detailed developer guide.
 cargo test -p audiobridge-core
 cargo build -p audiobridge-desktop --release         # target\release\AudioBridge.exe
 cd android; .\gradlew.bat :app:assembleDebug         # needs Android SDK, NDK r30 and cargo-ndk 4.x
+```
+
+Linux desktop app (needs the PipeWire development files, e.g. `pipewire` on Arch or `libpipewire-0.3-dev` on Debian/Ubuntu, plus `clang` for bindgen):
+
+```sh
+cargo build -p audiobridge-desktop --release         # target/release/AudioBridge
+scripts/package-linux.sh                             # target/dist: .tar.gz with install.sh, pacman package
 ```
 
 Rust ≥ 1.92. Opus is vendored and built with `cc`, so you don't need cmake.

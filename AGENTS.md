@@ -1,9 +1,9 @@
 # Repository Guidelines
 
 ## Project Overview
-AudioBridge turns an Android phone into the "headphones and microphone" of one or more Windows PCs:
-- PC system audio (WASAPI loopback) → phone → Bluetooth headphones.
-- Phone mic → PC virtual microphone (VB-CABLE "CABLE Output").
+AudioBridge turns an Android phone into the "headphones and microphone" of one or more Windows or Linux PCs:
+- PC system audio (WASAPI loopback; on Linux the PipeWire default sink's monitor) → phone → Bluetooth headphones.
+- Phone mic → PC virtual microphone (VB-CABLE "CABLE Output"; on Linux AudioBridge's own PipeWire source `audiobridge_mic`).
 
 Transport is iroh QUIC: LAN, hole-punched, relay fallback, and Tailscale IPs included in the pairing. Pairing is a single QR scan (`audiobridge://pair?d=<base64url>`). After that, both sides run in the background and autostart on boot. The phone can be paired with up to 8 PCs at once: audio from all of them is mixed, and the mic goes only to PCs whose apps are actually recording. All UI text is Russian; code, comments and logs are English. `README.md` / `README.ru.md` are the user-facing docs; this file is the developer doc. Public repo: `github.com/Lyten02/AudioBridge` (MIT); `main` is protected, changes go through PRs with the CI in `.github/workflows/ci.yml`.
 
@@ -20,7 +20,7 @@ PC (Server)  WASAPI render "CABLE Input" ◄─ PlayoutHandle (jitter buffer, de
 - **Roles:** `session::Server` is the PC side; it serves one active phone and a new connection replaces the old one (close codes 1 = replaced, 2 = rejected, 3 = shutdown). `session::Hub` is the phone side: one iroh endpoint, one task per PC, `MAX_PEERS = 8`, `SLOTS = 16`.
 - **Dialing:** the phone always dials the PC, which works through NAT and double NAT.
 - **Control (protocol v3):** a single bi-stream carrying `ControlMsg` frames (`len u16 | tag | body`): Hello{secret, PhoneControls} → Welcome{PcControls}/Reject, PcState, MicDemand, PhoneState, SetPc, SetPhone, PcMedia (v3). Each side reads the stream through `spawn_control_reader` (a task feeding a channel), so `select!` never cancels a half-read frame. A Hello of another version still decodes far enough to be rejected with a readable reason.
-- **Remote control:** each side owns its controls and reports them (`PcControls`: audio, mic, mic_default = CABLE Output is the Windows default recording device, default playback volume; `PhoneControls`: mic switch, mic_ready, media volume). The other side may ask for a change (`PcRequest` / `PhoneRequest`). Core never applies requests: `Server::take_requests` / `Hub::take_requests` hand them to the app, which applies them and reports the result through the setters (`Server::set_mic_default`, `set_volume`, …; `Hub::set_phone_controls`). `Status.pc` / `Status.phone` carry the reported state.
+- **Remote control:** each side owns its controls and reports them (`PcControls`: audio, mic, mic_default = the virtual mic is the default recording device, default playback volume; `PhoneControls`: mic switch, mic_ready, media volume). The other side may ask for a change (`PcRequest` / `PhoneRequest`). Core never applies requests: `Server::take_requests` / `Hub::take_requests` hand them to the app, which applies them and reports the result through the setters (`Server::set_mic_default`, `set_volume`, …; `Hub::set_phone_controls`). `Status.pc` / `Status.phone` carry the reported state.
 - **One-switch actions (PC):** "Микрофон" on = accept the mic + ask the phone to switch its mic on + make CABLE Output the default recording device; off = restore the remembered recording device (the phone mic is left alone: other PCs may use it). "Звук ПК" on also undoes a CABLE takeover of the default playback device.
 - **Headphone buttons → PC media (v3):** the earbuds turn taps into AVRCP commands; Android's Bluetooth stack dispatches play/pause/next/previous as media key events to the media session of the app that played audio last. `HeadsetControl.kt` (owned by `BridgeService`) keeps a `MediaSession` while the feature is on and exactly one PC is the target (`MediaTarget` in `MediaKeys.kt`: the chosen PC while connected, else the unmuted connected PC that plays / played or was controlled last / the only one; ambiguous → none, never fan-out). Without a target the session is released, so the keys go to other players. Its `PlaybackState` mirrors the target's `PcMedia`, which is also what the earbuds use to choose "play" or "pause". A press (first ACTION_DOWN) becomes `PcRequest::Media(MediaCommand)` via `controlPc(id, PC_MEDIA, code)`; a 3 s timed wake lock covers the screen-off send. The PC applies it to the Windows media session (GSMTC, `crates/desktop/src/media.rs`; SendInput media keys only when no session exists or the call fails) and reports `PcMedia` (playback, app, title, artist) through `Server::set_media`. Volume taps are NOT media keys: AVRCP volume up/down is dropped by `MediaSessionService` (not `isMediaSessionKey`) and absolute volume sets the phone's STREAM_MUSIC directly, so apps can't see or remap them; don't add a system-volume observer to fake it. "Один наушник" remaps only what arrives: the play/pause group = 2 taps, next/previous = 3 taps.
 - **Datagram header:** 8 bytes, `0xAB | kind | stream | 0 | seq u32 LE`. Kinds: Audio, Silence (after 300 ms of digital silence the sender emits markers and stops), Pace (an empty keep-awake packet that the Hub sends every 20 ms while a PC's audio streams and that PC isn't receiving our mic; with the screen off, Android ≥14 won't let apps disable Wi-Fi power save, and uplink traffic is what keeps the radio awake. Receivers ignore it).
@@ -36,6 +36,14 @@ PC (Server)  WASAPI render "CABLE Input" ◄─ PlayoutHandle (jitter buffer, de
   - Loopback runs only when `connected && pc_audio_enabled` and the default device is not a VB-CABLE device.
   - Mic render runs only while `mic.active`.
   - Mic demand comes from `audio/demand.rs`: another process holding an active capture session on "CABLE Output".
+- **Linux desktop (`crates/desktop/src/linux/`, PipeWire):** the same `service.rs`/`shared.rs`/`ui.rs`; `main.rs` swaps the platform modules with `#[cfg_attr(target_os = "linux", path = "linux/…")]` behind the same API (`audio`, `autostart`, `instance`, `media`, `paths`, `tray`).
+  - `audio/` runs one PipeWire main loop on `audio-supervisor` (reconnects every 2 s if PipeWire goes away). Every input is an event: registry globals, the `default` metadata, the default sink's `Props`, stream states, commands (`pw::channel`); callbacks only queue `Ev`s and `Ctx::post` drains them, because stream callbacks fire synchronously from `connect`/`disconnect`.
+  - Virtual mic `audiobridge_mic` (mono, `media.class = Audio/Source` + `node.virtual`; not `Audio/Source/Virtual`, which WirePlumber configures with input ports like a null sink, and a mono one never finishes configuring, stalling all its linking) exists for the whole connection; we never link it. PipeWire runs it only while something records, so mic demand = its stream state `Streaming`. It disappears with the process, also on a crash.
+  - Loopback `audiobridge_capture` (`stream.capture.sink`, no target: WirePlumber links it to the default sink's monitor and moves it with the default) runs only when `connected && pc_audio_enabled` and a default sink exists. Being linked keeps the sink running, so silence arrives as zeros and the sender's silence gate works without a gap filler.
+  - Core handles live in `Arc<Mutex<Option<_>>>` slots that survive stream re-creation; the real-time process callbacks only `try_lock` them and never allocate.
+  - Devices: endpoint ids are `node.name`s; `DeviceSummary` (`endpoints.rs`) comes from the registry + `default` metadata (`graph.rs`). "Микрофон по умолчанию" writes `default.configured.audio.source`; the user's configured choice counts, so turning AudioBridge off restores the remembered mic even though WirePlumber already fell back. `service.rs` asks through short-lived connections (`oneshot.rs`).
+  - Volume: read from the default sink's `Props` (`channelVolumes` linear → cubic percent, `mute`), written with `wpctl` (WirePlumber's mixer API also updates hardware routes).
+  - Media keys: MPRIS on the session bus (`zbus`, `PropertiesChanged`/`NameOwnerChanged`), exactly one target: the playing player (most recently active first), else the most recent one. Tray: StatusNotifierItem (`ksni`), optional (no session bus → no tray; a second launch shows the window). Autostart: `~/.config/autostart/audiobridge.desktop`. Single instance: Unix socket `$XDG_RUNTIME_DIR/audiobridge.sock` (`show`/`quit`). SIGTERM/SIGINT/SIGHUP run the normal shutdown.
 - **Android audio policy** (`policy.rs`): output opens on `pcAudioActive` and closes after 30 s idle. Mic capture runs iff `micWanted && phone.mic_allowed()` (user switch && mic_ready).
 
 ## Key Directories
@@ -44,9 +52,10 @@ PC (Server)  WASAPI render "CABLE Input" ◄─ PlayoutHandle (jitter buffer, de
   - `pairing.rs`: QR payload.
   - `audio/`: `tx`, `rx` (packet queue), `playout` (jitter buffer + decode-on-demand), `mixer`, `codec`, `sim` (test traces).
   - `session/`: `server.rs`, `hub.rs`, `net.rs` (endpoints, persisted keys, address ranking).
-- `crates/desktop/src/`: Windows tray app.
+- `crates/desktop/src/`: PC tray app. Top-level platform modules are Windows; `linux/` holds their Linux counterparts; `endpoints.rs`, `service.rs`, `shared.rs`, `settings.rs`, `ui.rs` and `icon.rs` are shared.
   - `audio/`: WASAPI loopback/render, devices, demand, `policy.rs` (IPolicyConfig default-device restore).
   - `ui.rs` (eframe), `tray.rs`, `selfinstall.rs`, `autostart.rs`, `instance.rs`, `cable_install.rs`.
+  - `linux/audio/`: `mod.rs` (engine), `streams.rs` (loopback + virtual mic), `graph.rs`, `volume.rs`, `oneshot.rs`; `linux/{media,tray,instance,autostart,paths}.rs`.
   - The window uses the brand gradient (indigo `#5B4BFF` → teal `#19C3D0`, the same as the Android launcher icon) and draws its icons with the painter. It repaints on status changes; the only timer (`request_repaint_after`, 40 ms) drives the level bars while PC audio streams and the window is open. Child widgets placed at an absolute rect use `ui.new_child(..)`: `scope_builder` moves the parent cursor and makes later cards overlap.
   - Close destroys the window, not the service. `WindowState` coalesces show requests while creation is pending; tray UP/DBLCLK/UP must not enqueue multiple windows that open after successive closes. Status repaint never opens a window.
 - `crates/android-native/src/`
@@ -57,6 +66,7 @@ PC (Server)  WASAPI render "CABLE Input" ◄─ PlayoutHandle (jitter buffer, de
   - `BridgeService.kt`: the foreground service. `HeadsetControl.kt`: the media session for headphone buttons; `MediaKeys.kt`: its pure logic (key mapping, target choice), JVM-tested.
   - `BootReceiver.kt`, `AppState.kt` (prefs incl. headset settings, StatusHub), `BridgeStatus.kt` (statusJson parser, `PairedPc`), `ui/` (`HeadsetCard.kt`: headphone-button settings).
 - `scripts/install-desktop.ps1`: build plus self-install of the desktop app.
+- `scripts/package-linux.sh` + `packaging/linux/`: Linux release packaging (per-user `.tar.gz` with `install.sh`, pacman `.pkg.tar.zst`, launcher entry, icon).
 
 ## Development Commands
 ```powershell
@@ -68,12 +78,17 @@ powershell -File scripts\install-desktop.ps1 [-SkipBuild] [-NoFirewall]
 cargo ndk -t arm64-v8a --platform 26 build --release -p audiobridge-android   # target/aarch64-linux-android/release/libaudiobridge.so (no -o: cargo-ndk 4 would also copy iroh's cdylibs)
 cargo ndk -t arm64-v8a --platform 26 clippy -p audiobridge-android --all-targets -- -D warnings   # Android clippy needs cargo-ndk (cc needs NDK clang)
 ```
+- **Linux desktop:** needs the PipeWire dev files (`pkg-config libpipewire-0.3`) and libclang for bindgen. On the netcup runner they are unpacked without root under `~/opt/pipewire-sdk`; `. ~/opt/pipewire-sdk/env.sh` first (it also provides a headless `pipewire`/`wireplumber`/`pw-*`/`wpctl` for smoke tests).
+  ```sh
+  cargo clippy -p audiobridge-desktop --all-targets -- -D warnings && cargo test -p audiobridge-desktop
+  cargo build -p audiobridge-desktop --release && scripts/package-linux.sh   # target/dist
+  ```
 - Debug-only isolation: `AUDIOBRIDGE_DEV_DIR=<absolute temp directory>` gives a separate identity, logs and instance mutex/events; seed `settings.json` with `"autostart": false` before testing beside the installed app. Release builds ignore this variable.
 - **APK:** run Gradle from inside `android/` (PowerShell: `Set-Location android; .\gradlew.bat :app:assembleDebug`). It runs `buildRustLib` (cargo-ndk) automatically; add `-PskipRust` to reuse the `.so` already in `jniLibs`. Also: `:app:testDebugUnitTest`, `:app:lintDebug`.
 - **Manual E2E without a phone or PC:**
   - Phone emulator against a running PC app: `cargo run -p audiobridge-core --example probe -- <pairing-uri> [--seconds N] [--mic-sine HZ] [--local]`.
   - Fake PC: `cargo run -p audiobridge-core --example local_server -- [--seconds N] [--sine HZ] [--local] [--mic-demand]` (prints `PAIRING_URI=`).
-- **Get the PC's pairing URI:** `AudioBridge.exe --print-pairing`, or read `%APPDATA%\AudioBridge\pairing.txt`.
+- **Get the PC's pairing URI:** `AudioBridge.exe --print-pairing` (Linux: `audiobridge --print-pairing`), or read `pairing.txt` in the data directory.
 - **Device:** `adb install -r android/app/build/outputs/apk/debug/app-debug.apk`; logs via `adb logcat -s AudioBridge:*`. You can add a PC with `adb shell am start -a android.intent.action.VIEW -d '<pairing-uri>' app.audiobridge`.
 
 ## Code Conventions & Common Patterns
@@ -85,7 +100,7 @@ cargo ndk -t arm64-v8a --platform 26 clippy -p audiobridge-android --all-targets
 - **Threads** have kebab-case names: `audiobridge-tx-*`, `audio-supervisor`, `ab-audio`, `ab-listener`, `ab-rt`. Every `unsafe` block needs a `// SAFETY:` comment.
 - **Logging:**
   - Core: `tracing`.
-  - Desktop: daily files in `%LOCALAPPDATA%\AudioBridge\logs`; filter via the `AUDIOBRIDGE_LOG` env var.
+  - Desktop: daily files in `%LOCALAPPDATA%\AudioBridge\logs` (Linux: `~/.local/state/audiobridge/logs`); filter via the `AUDIOBRIDGE_LOG` env var.
   - Android: `tracing` → `log` → logcat tag `AudioBridge`. The filter in `logging.rs` must keep `tracing::span=off`, otherwise span enter/exit lines flood logcat several times per audio frame.
 - **Contract coupling:** these pieces change together.
   - The statusJson v2 schema (`android-native/src/status.rs`, incl. the per-PC remote controls `pcMic`, `micDefault`, `pcVolume`, `pcMuted` and `media`) ↔ `BridgeStatus.kt` (which throws on unknown states).
@@ -95,6 +110,7 @@ cargo ndk -t arm64-v8a --platform 26 clippy -p audiobridge-android --all-targets
   - Persisted headset settings keys and `TapAction.pref` values (`AppState.kt`, `MediaKeys.kt`): never rename.
 - **Persisted state:**
   - PC: `%APPDATA%\AudioBridge` holds `server.key`, `pairing.secret`, `server.port`, `settings.json` and `pairing.txt`. Writes go through tmp+rename; corrupt files are regenerated. Changing `server.key` or `pairing.secret` breaks every existing pairing.
+  - Linux PC: the same files in `~/.config/audiobridge` (`$XDG_CONFIG_HOME`); endpoint ids in `settings.json` are PipeWire node names.
   - Phone: `<filesDir>/audiobridge/client.key`, plus SharedPreferences `audiobridge` (`paired_pcs` JSON list of `{id, name, uri, muted}`, `mic_enabled` (also flipped remotely by a PC), `autostart_done`, `service_enabled` (the global switch, missing = on), headphone buttons: `headset_enabled`, `headset_single_earbud`, `headset_double_tap`, `headset_triple_tap`, `headset_target`).
 - **Global switch (phone):** `Prefs.serviceEnabled` (written with `commit`). Off stops `BridgeService` (native `setPeers("[]")` → hub stopped, no notification, no media session); every start path (`MainActivity.startBridge`, `BootReceiver`, a sticky restart in `onStartCommand`) checks `Prefs.shouldRun()`. Pairings and settings stay. It never tells PCs to switch off: they just see the phone offline.
 - **Default UDP port:** 47130, falling back to a random port.
@@ -106,7 +122,7 @@ cargo ndk -t arm64-v8a --platform 26 clippy -p audiobridge-android --all-targets
   - the dev profile is disk-saving (`line-tables-only`, no incremental);
   - release uses thin LTO and strip.
 - `crates/core/src/{proto,pairing}.rs`: the wire format. Bump `PROTOCOL_VERSION` / the pairing version on incompatible changes.
-- `crates/desktop/src/main.rs`: CLI flags `--background`, `--print-pairing`, `--no-install`. Release builds self-install to `%LOCALAPPDATA%\Programs\AudioBridge\AudioBridge.exe`; debug builds run in place.
+- `crates/desktop/src/main.rs`: CLI flags `--background`, `--print-pairing`, `--no-install` (Windows), `--quit` (Linux: asks the running instance to exit, used by `install.sh`). Windows release builds self-install to `%LOCALAPPDATA%\Programs\AudioBridge\AudioBridge.exe`; debug builds run in place. Linux is installed by the package (`/usr/bin/audiobridge`) or `install.sh` (`~/.local/bin/audiobridge`).
 - `android/app/build.gradle.kts`: `buildRustLib` task, compile/target SDK 35, minSdk 26, arm64-v8a only.
 - `android/app/src/main/AndroidManifest.xml`:
   - FGS types `connectedDevice|microphone`;
@@ -129,6 +145,12 @@ cargo ndk -t arm64-v8a --platform 26 clippy -p audiobridge-android --all-targets
 - **Windows:**
   - Desktop `windows` crate features are listed explicitly; new Win32 APIs need the matching feature added.
   - Mic routing requires VB-CABLE. Installing it can hijack the default playback device; the app detects this and offers a restore.
+- **Linux:**
+  - Runtime: libpipewire-0.3 (≥ 0.3.49) and WirePlumber (`wpctl`, the `default` metadata, linking); the GUI loads Wayland/X11, xkbcommon and EGL with `dlopen`. The release binary is built on Debian 13 and links only glibc, libgcc and libpipewire.
+  - Platform crates are target-specific dependencies (`pipewire`, `ksni`, `zbus`; eframe `wayland`+`x11`). Keep Windows-only code behind `#[cfg(windows)]` so `cargo xwin clippy` and Linux clippy both stay clean.
+  - The window has the app id/class `audiobridge` (Hyprland: `windowrule = float, class:^(audiobridge)$`).
+  - Keep EGL vsync off on Linux (`glow_options.vsync = false` in `ui.rs`). With vsync, a repaint while the window sits on a hidden workspace blocks the UI thread in the EGL swap (`wl_display_dispatch_queue`) until the window is shown again: compositor pings go unanswered (Hyprland's "not responding" dialog kills with SIGKILL, so no cleanup runs) and SIGTERM/"Выход" cannot finish.
+  - Headless smoke without real audio hardware: a private `pipewire` + `wireplumber` with a `support.null-audio-sink` as the default sink; play a tone into it, run `probe --mic-sine 440` against the app, record `pw-record --target audiobridge_mic`. A fake mic made from a null sink must be `Audio/Source/Virtual` (a null sink is an input node; as `Audio/Source` it stalls WirePlumber).
 - **Disk:** disk space is tight. Share `target/`, don't create extra target dirs, and don't commit generated paths (`target/`, `android/app/src/main/jniLibs/`, `android/local.properties`, Gradle build dirs, `android/.kotlin/`). `Cargo.lock` is committed.
 
 ## Testing & QA
@@ -141,9 +163,12 @@ cargo ndk -t arm64-v8a --platform 26 clippy -p audiobridge-android --all-targets
   - android-native: host tests for the statusJson v2 schema, `NotifyGate` debounce, `controlPc` mapping, policies and peer parsing.
   - Android: JVM tests `BridgeStatusTest`, `PairedPcTest` and `MediaKeysTest` (key mapping incl. single-earbud, one press = one command, target choice, settings persistence) (`isReturnDefaultValues = false`); there is no instrumented test.
   - Desktop: resampler, persisted service default/roundtrip, show-request coalescing, and service-generation request gating tests.
-- **What's not tested:** WASAPI, AAudio, JNI, the UI and the service. Verify those on real hardware:
+  - Linux desktop: device summary from the PipeWire graph (configured vs effective default mic), linear → cubic volume, MPRIS target choice and command resolution, PRETTY_HOSTNAME parsing, autostart `Exec=` quoting.
+- **What's not tested:** WASAPI, PipeWire, AAudio, JNI, the UI and the service. Verify those on real hardware:
   - PC audio: play a tone on the PC → the phone UI shows "Звук" / buffer.
   - Mic: `ffmpeg -f dshow -i audio="CABLE Output (VB-Audio Virtual Cable)" -t 8 -af volumedetect -f null -` should report non-silent levels while the phone mic is allowed.
+  - Linux mic: `pw-record --target audiobridge_mic -` (or any app recording «AudioBridge: микрофон телефона») → the PC log shows `mic demand: true` and the recording isn't silent; after "Выход" or `kill -9`, `pw-cli ls Node` has no `audiobridge_*` nodes. `wpctl status` lists `audiobridge_mic` under "Default Configured Devices" after a `kill -9` with the phone mic as default: that is the remembered default (metadata), not a node.
+  - Hidden window (Linux): put the window on another workspace, then add/remove an audio device or connect the phone. The main thread must stay in `epoll_pwait` (`/proc/<pid>/syscall` starts with 281, not 7 = `poll`), and `kill <pid>` must exit at once with `shutting down` in the log.
   - Autostart: reboot the phone → the PC log shows `phone 'POCO F5' connected`.
   - Headphone buttons: play music on the PC through AudioBridge, screen off, double/triple tap → the PC log shows `media command …` and the player reacts; the app's "Последняя команда" line shows what the phone received (`adb logcat -s AudioBridge:*` → `media command N -> PC`).
 - **Clippy:** `-D warnings` is the working bar for all crates. GitHub CI (Windows) runs clippy plus the core lib/rt_alloc, desktop and android-native host tests; the timing-sensitive integration tests and Android/Gradle checks run locally only. Android lint must stay at 0 errors.
