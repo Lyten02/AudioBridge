@@ -2,7 +2,6 @@
 //! window exists while AudioBridge sits in the tray. Repaints on status changes; the only
 //! animation (the level bars) runs while PC audio is streaming and the window is open.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,14 +11,21 @@ use eframe::egui::{
     Margin, Mesh, Painter, Pos2, Rect, RichText, Sense, Shape, Stroke, StrokeKind, TextureHandle, TextureOptions, Ui,
     UiBuilder,
 };
+#[cfg(windows)]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+#[cfg(windows)]
 use windows::core::{w, BOOL, HSTRING};
+#[cfg(windows)]
 use windows::Win32::Foundation::HWND;
+#[cfg(windows)]
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CAPTION_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE};
+#[cfg(windows)]
 use windows::Win32::UI::Shell::ShellExecuteW;
+#[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 use crate::audio::DeviceSummary;
+#[cfg(windows)]
 use crate::cable_install::{self, InstallState};
 use crate::icon;
 use crate::settings::Settings;
@@ -42,8 +48,21 @@ const TOGGLE_OFF: Color32 = Color32::from_rgb(0x2E, 0x33, 0x45);
 const WARN_BG: Color32 = Color32::from_rgb(0x24, 0x1D, 0x10);
 const WARN_STROKE: Color32 = Color32::from_rgb(0x5A, 0x45, 0x15);
 
+#[cfg(windows)]
 const VB_CABLE_URL: &str = "https://vb-audio.com/Cable/";
 const REPO_URL: &str = "https://github.com/Lyten02/AudioBridge";
+
+#[cfg(windows)]
+const AUTOSTART_TITLE: &str = "Запускать вместе с Windows";
+#[cfg(target_os = "linux")]
+const AUTOSTART_TITLE: &str = "Запускать при входе в систему";
+#[cfg(windows)]
+const MIC_DEFAULT_HINT: &str = "CABLE Output — основной микрофон Windows";
+#[cfg(target_os = "linux")]
+const MIC_DEFAULT_HINT: &str = "«AudioBridge: микрофон телефона» — микрофон по умолчанию";
+/// Wayland app id / X11 class: lets compositor rules (e.g. Hyprland `float`) match the window.
+#[cfg(target_os = "linux")]
+const APP_ID: &str = "audiobridge";
 
 const PAD: f32 = 16.0;
 const GAP: f32 = 12.0;
@@ -51,16 +70,26 @@ const TILE_H: f32 = 148.0;
 
 /// Opens the window and blocks until it is closed (the app keeps running in the tray).
 pub fn run_window() {
+    let viewport = egui::ViewportBuilder::default()
+        .with_title("AudioBridge")
+        .with_inner_size([400.0, 680.0])
+        .with_resizable(false)
+        .with_maximize_button(false)
+        .with_icon(Arc::new(egui::IconData { rgba: icon::render(64, false), width: 64, height: 64 }));
+    #[cfg(target_os = "linux")]
+    let viewport = viewport.with_app_id(APP_ID);
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("AudioBridge")
-            .with_inner_size([400.0, 680.0])
-            .with_resizable(false)
-            .with_maximize_button(false)
-            .with_icon(Arc::new(egui::IconData { rgba: icon::render(64, false), width: 64, height: 64 })),
+        viewport,
         renderer: eframe::Renderer::Glow,
         centered: true,
         run_and_return: true,
+        // Wayland: with vsync, EGL's swap waits for the compositor's frame callback, and
+        // compositors send none to a window on a hidden workspace. The UI thread then stops
+        // answering compositor pings (Hyprland offers to kill the "not responding" app with
+        // SIGKILL) and cannot exit on SIGTERM/"Выход" until the window is shown again. The UI
+        // repaints only on changes (every 40 ms at most while streaming), so it needs no vsync.
+        #[cfg(target_os = "linux")]
+        glow_options: eframe::egui_glow::GlowConfiguration { vsync: false, ..Default::default() },
         ..Default::default()
     };
     let result = eframe::run_native(
@@ -68,11 +97,16 @@ pub fn run_window() {
         options,
         Box::new(|cc| {
             setup_style(&cc.egui_ctx);
+            #[cfg(windows)]
             let hwnd = match cc.window_handle().map(|h| h.as_raw()) {
                 Ok(RawWindowHandle::Win32(h)) => h.hwnd.get(),
                 _ => 0,
             };
+            #[cfg(windows)]
             dark_title_bar(hwnd);
+            // the compositor owns Wayland/X11 windows; raising goes through the egui context
+            #[cfg(target_os = "linux")]
+            let hwnd = 0;
             shared().register_window(hwnd, cc.egui_ctx.clone());
             Ok(Box::new(UiApp::default()))
         }),
@@ -85,16 +119,21 @@ pub fn run_window() {
 
 fn setup_style(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
-    let dir = std::env::var_os("WINDIR").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from).join("Fonts");
+    let system = system_fonts();
     let mut proportional = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
-    if let Ok(bytes) = std::fs::read(dir.join("segoeui.ttf")) {
-        fonts.font_data.insert("segoe".into(), Arc::new(FontData::from_owned(bytes)));
-        proportional.insert(0, "segoe".into());
+    if let Some(bytes) = system.symbols {
+        // second in line: glyphs the UI font lacks (e.g. "→" in Noto Sans)
+        fonts.font_data.insert("ui-symbols".into(), Arc::new(FontData::from_owned(bytes)));
+        proportional.insert(0, "ui-symbols".into());
+    }
+    if let Some(bytes) = system.regular {
+        fonts.font_data.insert("ui".into(), Arc::new(FontData::from_owned(bytes)));
+        proportional.insert(0, "ui".into());
     }
     let mut semibold = proportional.clone();
-    if let Ok(bytes) = std::fs::read(dir.join("seguisb.ttf")) {
-        fonts.font_data.insert("segoe-sb".into(), Arc::new(FontData::from_owned(bytes)));
-        semibold.insert(0, "segoe-sb".into());
+    if let Some(bytes) = system.semibold {
+        fonts.font_data.insert("ui-semibold".into(), Arc::new(FontData::from_owned(bytes)));
+        semibold.insert(0, "ui-semibold".into());
     }
     fonts.families.insert(FontFamily::Proportional, proportional);
     fonts.families.insert(FontFamily::Name("semibold".into()), semibold);
@@ -118,7 +157,58 @@ fn setup_style(ctx: &egui::Context) {
     });
 }
 
+/// Font files found on the system; `None` falls back to egui's bundled fonts.
+struct SystemFonts {
+    regular: Option<Vec<u8>>,
+    semibold: Option<Vec<u8>>,
+    symbols: Option<Vec<u8>>,
+}
+
+/// Segoe UI regular and semibold.
+#[cfg(windows)]
+fn system_fonts() -> SystemFonts {
+    let dir = std::env::var_os("WINDIR")
+        .map_or_else(|| std::path::PathBuf::from(r"C:\Windows"), std::path::PathBuf::from)
+        .join("Fonts");
+    SystemFonts {
+        regular: std::fs::read(dir.join("segoeui.ttf")).ok(),
+        semibold: std::fs::read(dir.join("seguisb.ttf")).ok(),
+        symbols: None,
+    }
+}
+
+/// A common sans-serif with Cyrillic (Noto on Arch/Omarchy, then DejaVu/Liberation), plus a
+/// font with the arrows Noto Sans lacks.
+#[cfg(target_os = "linux")]
+fn system_fonts() -> SystemFonts {
+    const REGULAR: &[&str] = &[
+        "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+    ];
+    const SEMIBOLD: &[&str] = &[
+        "/usr/share/fonts/noto/NotoSans-SemiBold.ttf",
+        "/usr/share/fonts/noto/NotoSans-Medium.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-SemiBold.ttf",
+        "/usr/share/fonts/noto/NotoSans-Bold.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/liberation/LiberationSans-Bold.ttf",
+    ];
+    const SYMBOLS: &[&str] = &[
+        "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ];
+    let first = |paths: &[&str]| paths.iter().find_map(|p| std::fs::read(p).ok());
+    SystemFonts { regular: first(REGULAR), semibold: first(SEMIBOLD), symbols: first(SYMBOLS) }
+}
+
 /// Dark caption matching the window background (Windows 11; ignored where unsupported).
+#[cfg(windows)]
 fn dark_title_bar(hwnd: isize) {
     if hwnd == 0 {
         return;
@@ -169,10 +259,21 @@ fn status_line(s: &Status) -> (String, Color32) {
     }
 }
 
+#[cfg(windows)]
 fn open_url(url: &str) {
     // SAFETY: ShellExecuteW with valid NUL-terminated strings.
     unsafe {
         ShellExecuteW(None, w!("open"), &HSTRING::from(url), None, None, SW_SHOWNORMAL);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_url(url: &str) {
+    let spawned = std::process::Command::new("xdg-open").arg(url).spawn();
+    match spawned {
+        // reap it off the UI thread; xdg-open returns once the browser was asked
+        Ok(mut child) => drop(std::thread::Builder::new().name("xdg-open".into()).spawn(move || child.wait())),
+        Err(e) => tracing::warn!("xdg-open {url}: {e}"),
     }
 }
 
@@ -434,7 +535,7 @@ impl eframe::App for UiApp {
                     }
                 }
                 card(ui, CARD, CARD_STROKE, |ui| {
-                    if switch_row(ui, "Запускать вместе с Windows", Some("Работает в фоне из трея"), settings.autostart) {
+                    if switch_row(ui, AUTOSTART_TITLE, Some("Работает в фоне из трея"), settings.autostart) {
                         sh.set_autostart(!settings.autostart);
                     }
                 });
@@ -682,7 +783,7 @@ fn controls_card(ui: &mut Ui, status: &Status, devices: &DeviceSummary, edit: &m
 
         let on = devices.default_capture_is_cable;
         let has_cable = devices.cable_capture_id.is_some();
-        let sub = if has_cable { "CABLE Output — основной микрофон Windows" } else { "Нужен VB-CABLE" };
+        let sub = if has_cable { MIC_DEFAULT_HINT } else { "Нужен VB-CABLE" };
         if switch_row(ui, "Микрофон по умолчанию", Some(sub), on) && has_cable {
             sh.set_mic_default(!on);
         }
@@ -855,6 +956,7 @@ fn warnings(ui: &mut Ui, devices: &DeviceSummary, settings: &Settings) {
             }
         });
     }
+    #[cfg(windows)]
     if devices.cable_render_id.is_none() {
         let state = sh.cable_install_state();
         card(ui, WARN_BG, WARN_STROKE, |ui| {

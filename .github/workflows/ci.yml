@@ -18,6 +18,8 @@ env:
 
 # Self-hosted jobs run on the netcup server's `audiobridge` runner, which already has the
 # toolchains (Rust + targets, JDK 17, Android SDK/NDK r30, cargo-ndk 4.x, cargo-xwin + LLVM).
+# The Linux desktop job also needs the PipeWire 1.x SDK (headers, pkg-config, libclang); on the
+# runner it is unpacked without root under ~/opt/pipewire-sdk and enabled by its env.sh.
 # Fork PRs are never executed there. CARGO_BUILD_JOBS=2 leaves half of its 4 cores free.
 jobs:
   rust:
@@ -54,6 +56,29 @@ jobs:
         with:
           name: AudioBridge.exe
           path: target/x86_64-pc-windows-msvc/release/AudioBridge.exe
+          if-no-files-found: error
+
+  linux:
+    name: Linux desktop (PipeWire)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, audiobridge]
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clippy
+        run: . "$HOME/opt/pipewire-sdk/env.sh" && cargo clippy -p audiobridge-desktop --all-targets -- -D warnings
+      - name: Tests
+        run: . "$HOME/opt/pipewire-sdk/env.sh" && cargo test -p audiobridge-desktop
+      - name: Build + package (tar.gz, pacman)
+        run: |
+          . "$HOME/opt/pipewire-sdk/env.sh"
+          cargo build -p audiobridge-desktop --release
+          scripts/package-linux.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AudioBridge-linux-x86_64
+          path: target/dist/*
           if-no-files-found: error
 
   android:

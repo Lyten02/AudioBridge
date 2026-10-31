@@ -9,12 +9,15 @@ use audiobridge_core::pairing::PairingInfo;
 use audiobridge_core::proto::MAX_LEVEL;
 use audiobridge_core::session::{ConnState, PcMedia, PcRequest, PhoneRequest, Server, Status, Volume};
 use tokio::task::JoinHandle;
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+#[cfg(windows)]
+use windows::Win32::Foundation::HWND;
+#[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
-    IsIconic, PostMessageW, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
+    IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
 };
 
-use crate::audio::{AudioMsg, Desired, DeviceSummary};
+use crate::audio::{AudioMsg, AudioSender, Desired, DeviceSummary};
+#[cfg(windows)]
 use crate::cable_install::InstallState;
 use crate::settings::Settings;
 use crate::{autostart, tray};
@@ -36,16 +39,17 @@ pub struct Shared {
     settings: Mutex<Settings>,
     devices: Mutex<DeviceSummary>,
     ui_ctx: Mutex<Option<eframe::egui::Context>>,
+    /// Native window handle (HWND) on Windows; 0 elsewhere.
     window_hwnd: AtomicIsize,
     window_state: Mutex<WindowState>,
-    tray_hwnd: AtomicIsize,
     tray_connected: AtomicBool,
     tray_tip: Mutex<String>,
     main_tx: Sender<MainCmd>,
     exiting: AtomicBool,
     service_generation: AtomicU64,
-    audio_tx: Mutex<Option<Sender<AudioMsg>>>,
+    audio_tx: Mutex<Option<AudioSender>>,
     media_tx: Mutex<Option<crate::media::Sender>>,
+    #[cfg(windows)]
     cable_install: Mutex<InstallState>,
 }
 
@@ -79,7 +83,6 @@ pub fn init(
         ui_ctx: Mutex::new(None),
         window_hwnd: AtomicIsize::new(0),
         window_state: Mutex::new(if background { WindowState::Closed } else { WindowState::Opening }),
-        tray_hwnd: AtomicIsize::new(0),
         tray_connected: AtomicBool::new(false),
         tray_tip: Mutex::new(tip.to_owned()),
         main_tx,
@@ -87,6 +90,7 @@ pub fn init(
         service_generation: AtomicU64::new(0),
         audio_tx: Mutex::new(None),
         media_tx: Mutex::new(None),
+        #[cfg(windows)]
         cable_install: Mutex::new(InstallState::Idle),
     };
     if SHARED.set(state).is_err() {
@@ -187,13 +191,7 @@ impl Shared {
     }
 
     fn refresh_tray(&self) {
-        let hwnd = self.tray_hwnd.load(Ordering::SeqCst);
-        if hwnd != 0 {
-            // SAFETY: posting a refresh to our own tray window.
-            unsafe {
-                let _ = PostMessageW(Some(HWND(hwnd as *mut _)), tray::WM_TRAY_REFRESH, WPARAM(0), LPARAM(0));
-            }
-        }
+        tray::refresh();
     }
 
     pub fn settings(&self) -> Settings {
@@ -369,7 +367,7 @@ impl Shared {
         self.repaint();
     }
 
-    pub fn set_audio_sender(&self, tx: Sender<AudioMsg>) {
+    pub fn set_audio_sender(&self, tx: AudioSender) {
         *lock(&self.audio_tx) = Some(tx);
     }
 
@@ -395,10 +393,12 @@ impl Shared {
         let _ = self.main_tx.send(MainCmd::DefaultDevice { generation, id, what });
     }
 
+    #[cfg(windows)]
     pub fn cable_install_state(&self) -> InstallState {
         lock(&self.cable_install).clone()
     }
 
+    #[cfg(windows)]
     pub fn set_cable_install_state(&self, s: InstallState) {
         *lock(&self.cable_install) = s;
         self.repaint();
@@ -427,14 +427,26 @@ impl Shared {
 
     /// Brings the window to front, creating it if it is closed.
     pub fn show_window(&self) {
-        let hwnd = self.window_hwnd.load(Ordering::SeqCst);
-        if hwnd != 0 {
-            let hwnd = HWND(hwnd as *mut _);
-            // SAFETY: plain user32 calls on a window handle we created (stale handles fail harmlessly).
-            unsafe {
-                let _ = ShowWindow(hwnd, if IsIconic(hwnd).as_bool() { SW_RESTORE } else { SW_SHOW });
-                let _ = SetForegroundWindow(hwnd);
+        #[cfg(windows)]
+        let open = {
+            let hwnd = self.window_hwnd.load(Ordering::SeqCst);
+            if hwnd != 0 {
+                let hwnd = HWND(hwnd as *mut _);
+                // SAFETY: plain user32 calls on a window handle we created (stale handles fail harmlessly).
+                unsafe {
+                    let _ = ShowWindow(hwnd, if IsIconic(hwnd).as_bool() { SW_RESTORE } else { SW_SHOW });
+                    let _ = SetForegroundWindow(hwnd);
+                }
             }
+            hwnd != 0
+        };
+        // Wayland/X11: un-minimize and ask the compositor for focus (it may only mark the window urgent).
+        #[cfg(target_os = "linux")]
+        let open = lock(&self.ui_ctx).as_ref().map(|ctx| {
+            ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Focus);
+        }).is_some();
+        if open {
             self.repaint();
         } else if !self.is_exiting() && lock(&self.window_state).request_open() {
             let _ = self.main_tx.send(MainCmd::Show);
@@ -456,10 +468,6 @@ impl Shared {
 
     // ---- tray -------------------------------------------------------------------------------
 
-    pub fn set_tray_hwnd(&self, hwnd: isize) {
-        self.tray_hwnd.store(hwnd, Ordering::SeqCst);
-    }
-
     pub fn tray_state(&self) -> (bool, String) {
         (self.tray_connected.load(Ordering::SeqCst), lock(&self.tray_tip).clone())
     }
@@ -473,13 +481,7 @@ impl Shared {
         };
         self.tray_connected.store(connected, Ordering::SeqCst);
         if changed {
-            let hwnd = self.tray_hwnd.load(Ordering::SeqCst);
-            if hwnd != 0 {
-                // SAFETY: posting to our own tray window.
-                unsafe {
-                    let _ = PostMessageW(Some(HWND(hwnd as *mut _)), tray::WM_TRAY_REFRESH, WPARAM(0), LPARAM(0));
-                }
-            }
+            tray::refresh();
         }
     }
 
@@ -489,7 +491,7 @@ impl Shared {
     pub fn spawn_watchers(
         &'static self,
         rt: &tokio::runtime::Runtime,
-        audio: Sender<AudioMsg>,
+        audio: AudioSender,
         generation: u64,
     ) -> Vec<JoinHandle<()>> {
         let server = lock(&self.server);
