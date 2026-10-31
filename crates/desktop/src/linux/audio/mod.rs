@@ -189,14 +189,12 @@ impl Engine {
             (self.hooks.on_volume)(volume);
             self.reported_volume = Some(volume);
         }
-        if self.desired.connected {
-            if self.reported_demand != Some(self.demand) {
-                tracing::info!("mic demand: {}", self.demand);
-                (self.hooks.on_demand)(self.demand);
-                self.reported_demand = Some(self.demand);
-            }
-        } else {
-            self.reported_demand = None;
+        // The server retains demand for the next Welcome, even while disconnected.
+        // Closing the last reader offline must clear it before a phone reconnects.
+        if self.reported_demand != Some(self.demand) {
+            tracing::info!("mic demand: {}", self.demand);
+            (self.hooks.on_demand)(self.demand);
+            self.reported_demand = Some(self.demand);
         }
     }
 }
@@ -223,6 +221,7 @@ struct Session {
     capture_failed: bool,
     mic: Option<VirtualMic>,
     mic_failed: bool,
+    mic_streaming: bool,
     lost: Option<String>,
 }
 
@@ -317,6 +316,7 @@ fn run_session(engine: Engine, rx: pw::channel::Receiver<AudioMsg>) -> Back {
         capture_failed: false,
         mic: None,
         mic_failed: false,
+        mic_streaming: false,
         lost: None,
     };
     let ctx = Rc::new(Ctx {
@@ -427,7 +427,7 @@ impl Inner {
                     s.mic = None;
                     s.mic_failed = true;
                 }
-                engine.demand = state == StreamState::Streaming;
+                s.mic_streaming = state == StreamState::Streaming;
             }
             Ev::CaptureState(state) => {
                 tracing::debug!("loopback: {state:?}");
@@ -512,6 +512,7 @@ impl Inner {
             tracing::info!("loopback stopped");
         }
 
+        engine.demand = s.mic_streaming && s.graph.mic_has_readers();
         let volume = s.sink.as_ref().and_then(|w| w.volume);
         engine.report(volume);
     }
@@ -533,6 +534,9 @@ impl Session {
                 if self.graph.nodes.len() != before {
                     self.globals.insert(obj.id, obj);
                 }
+            }
+            ObjectType::Link => {
+                self.graph.add_link(obj.id, get("link.output.node"), get("link.input.node"));
             }
             ObjectType::Metadata if get("metadata.name") == Some("default") => {
                 let metadata = match self.registry.bind::<Metadata, _>(&obj) {

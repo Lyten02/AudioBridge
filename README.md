@@ -51,6 +51,10 @@ The UI is in Russian for now. Translations are welcome.
 
 On Linux the phone mic appears as the input «AudioBridge: микрофон телефона». Pick it in an app, or switch on «Микрофон по умолчанию» in AudioBridge. On Hyprland the window can float with a rule for the class `audiobridge`.
 
+Linux mic demand requires a live outgoing PipeWire link as well as a streaming source. The adapter can remain `Streaming` after the last reader closes; this no longer keeps the phone microphone active. Reader changes are also recorded while the phone is disconnected, so the next connection starts with current demand rather than stale demand. No Android update or protocol change is needed.
+
+To check the lifecycle, open two readers on `audiobridge_mic`: closing one must keep the mic active, closing the last must return the phone to standby. Repeat after a timeout/reconnect, including closing the last reader while disconnected, and after stopping/restarting AudioBridge. Check live graph nodes/links, not only the remembered default-device name. Starting or restarting the app observes the existing output volume; volume writes require a local or remote control action.
+
 ## How it works
 
 ```

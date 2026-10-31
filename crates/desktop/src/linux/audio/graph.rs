@@ -71,6 +71,8 @@ pub struct Graph {
     /// Audio device nodes by global id.
     pub nodes: BTreeMap<u32, NodeEntry>,
     pub defaults: Defaults,
+    /// Links by global id, including readers (which are not device nodes).
+    links: BTreeMap<u32, (u32, u32)>,
 }
 
 impl Graph {
@@ -83,8 +85,27 @@ impl Graph {
         }
     }
 
+    pub fn add_link(&mut self, id: u32, output: Option<&str>, input: Option<&str>) {
+        if let (Some(output), Some(input)) = (
+            output.and_then(|v| v.parse().ok()),
+            input.and_then(|v| v.parse().ok()),
+        ) {
+            self.links.insert(id, (output, input));
+        }
+    }
+
     pub fn remove(&mut self, id: u32) -> bool {
+        self.links.remove(&id);
+        self.links.retain(|_, (output, input)| *output != id && *input != id);
         self.nodes.remove(&id).is_some()
+    }
+
+    /// A source adapter can stay Streaming after its last consumer is unlinked.
+    /// Demand therefore also requires a live outgoing graph link, not just stream state.
+    pub fn mic_has_readers(&self) -> bool {
+        self.find(MIC_NODE_NAME).is_some_and(|(mic, _)| {
+            self.links.values().any(|(output, _)| *output == mic)
+        })
     }
 
     pub fn find(&self, name: &str) -> Option<(u32, &NodeEntry)> {
@@ -179,5 +200,38 @@ mod tests {
         assert!(g.summary().default_render_id.is_none());
         g.defaults.apply("default.audio.sink", None);
         assert!(g.default_sink().is_none());
+    }
+
+    #[test]
+    fn mic_demand_ends_only_when_the_last_reader_link_is_removed() {
+        let mut g = graph();
+        g.add_link(60, Some("41"), Some("50")); // unrelated microphone
+        assert!(!g.mic_has_readers());
+        g.add_link(61, Some("42"), Some("51"));
+        g.add_link(62, Some("42"), Some("52"));
+        assert!(g.mic_has_readers());
+        g.remove(61);
+        assert!(g.mic_has_readers());
+        g.remove(62);
+        assert!(!g.mic_has_readers());
+        g.add_link(63, Some("42"), Some("53"));
+        assert!(g.mic_has_readers());
+        g.remove(53); // reader node removal can precede its link removal
+        assert!(!g.mic_has_readers());
+    }
+
+    #[test]
+    fn removed_mic_and_reused_node_ids_do_not_keep_demand() {
+        let mut g = graph();
+        g.add_link(60, Some("42"), Some("51"));
+        assert!(g.mic_has_readers());
+        g.remove(42);
+        assert!(!g.mic_has_readers());
+        g.add_node(42, Some(MIC_NODE_NAME), None, Some("Audio/Source"));
+        assert!(!g.mic_has_readers());
+        g.add_link(61, Some("42"), Some("51"));
+        assert!(g.mic_has_readers());
+        // A new PipeWire session starts with an empty graph, never stale links.
+        assert!(!Graph::default().mic_has_readers());
     }
 }
